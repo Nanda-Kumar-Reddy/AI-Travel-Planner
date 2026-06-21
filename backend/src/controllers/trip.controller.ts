@@ -4,7 +4,8 @@ import { Trip } from '../models/Trip';
 import { AppError, catchAsync } from '../utils/errors';
 import { getAuthUser } from '../types/auth.helpers';
 import { geocodeDestination } from '../services/geocoding.service';
-import { generateItinerary } from '../services/gemini.service';
+import { generateItinerary, regenerateDayActivities } from '../services/gemini.service';
+import type { DayDiff, ActivityShape } from '../types/trip.types';
 
 // ─── POST /api/trips ──────────────────────────────────────────────────────────
 // Synchronous: geocode → generate → validate → save → respond (Issue-3 amendment)
@@ -121,4 +122,155 @@ export const deleteTrip = catchAsync(async (req: Request, res: Response): Promis
   }
 
   res.status(200).json({ message: 'Trip deleted successfully.' });
+});
+
+// ─── POST /api/trips/:id/days/:dayNumber/activities ───────────────────────────
+export const addActivity = catchAsync(async (req: Request, res: Response): Promise<void> => {
+  const { id: userId } = getAuthUser(req);
+  const { id: tripId, dayNumber: dayNumberStr } = req.params;
+  const dayNumber = parseInt(dayNumberStr, 10);
+
+  if (isNaN(dayNumber)) throw new AppError('Invalid day number.', 400);
+
+  const { title, description, estimatedCostUSD, timeOfDay, lat, lng } = req.body as {
+    title?: string;
+    description?: string;
+    estimatedCostUSD?: number;
+    timeOfDay?: string;
+    lat?: number;
+    lng?: number;
+  };
+
+  if (!title?.trim()) throw new AppError('Activity title is required.', 400);
+  if (!['Morning', 'Afternoon', 'Evening'].includes(timeOfDay ?? '')) {
+    throw new AppError('timeOfDay must be Morning, Afternoon, or Evening.', 400);
+  }
+
+  // Ownership check — same { _id, userId } pattern as all other routes
+  const trip = await Trip.findOne({ _id: tripId, userId });
+  if (!trip) throw new AppError('Trip not found.', 404);
+
+  const day = trip.itinerary.find((d) => d.dayNumber === dayNumber);
+  if (!day) throw new AppError(`Day ${dayNumber} not found on this trip.`, 404);
+
+  // Double-cast: IActivity[] → unknown → any to satisfy Mongoose's DocumentArray push
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (day.activities as unknown as any[]).push({
+    title: title.trim(),
+    description: description?.trim() ?? '',
+    estimatedCostUSD: Number(estimatedCostUSD) || 0,
+    timeOfDay,
+    ...(lat !== undefined && { lat: Number(lat) }),
+    ...(lng !== undefined && { lng: Number(lng) }),
+  });
+
+  await trip.save();
+  console.log(`[Trip] Added activity to day ${dayNumber} of trip ${tripId}`);
+  res.status(201).json({ trip });
+});
+
+// ─── DELETE /api/trips/:id/days/:dayNumber/activities/:activityId ─────────────
+export const removeActivity = catchAsync(async (req: Request, res: Response): Promise<void> => {
+  const { id: userId } = getAuthUser(req);
+  const { id: tripId, dayNumber: dayNumberStr, activityId } = req.params;
+  const dayNumber = parseInt(dayNumberStr, 10);
+
+  if (isNaN(dayNumber)) throw new AppError('Invalid day number.', 400);
+
+  const trip = await Trip.findOne({ _id: tripId, userId });
+  if (!trip) throw new AppError('Trip not found.', 404);
+
+  const day = trip.itinerary.find((d) => d.dayNumber === dayNumber);
+  if (!day) throw new AppError(`Day ${dayNumber} not found on this trip.`, 404);
+
+  const activityIndex = day.activities.findIndex(
+    (a) => a._id.toString() === activityId
+  );
+  if (activityIndex === -1) throw new AppError('Activity not found.', 404);
+
+  day.activities.splice(activityIndex, 1);
+  await trip.save();
+
+  console.log(`[Trip] Removed activity ${activityId} from day ${dayNumber} of trip ${tripId}`);
+  res.status(200).json({ trip });
+});
+
+// ─── POST /api/trips/:id/days/:dayNumber/regenerate ───────────────────────────
+export const regenerateDay = catchAsync(async (req: Request, res: Response): Promise<void> => {
+  const { id: userId } = getAuthUser(req);
+  const { id: tripId, dayNumber: dayNumberStr } = req.params;
+  const dayNumber = parseInt(dayNumberStr, 10);
+
+  if (isNaN(dayNumber)) throw new AppError('Invalid day number.', 400);
+
+  const { userFeedback, riskContext } = req.body as {
+    userFeedback?: string;
+    riskContext?: string;
+  };
+
+  if (!userFeedback?.trim() && !riskContext?.trim()) {
+    throw new AppError('At least userFeedback or riskContext is required.', 400);
+  }
+
+  // Ownership check
+  const trip = await Trip.findOne({ _id: tripId, userId });
+  if (!trip) throw new AppError('Trip not found.', 404);
+
+  const day = trip.itinerary.find((d) => d.dayNumber === dayNumber);
+  if (!day) throw new AppError(`Day ${dayNumber} not found on this trip.`, 404);
+
+  // Capture the "before" state before any mutation
+  const before: DayDiff['before'] = day.activities.map((a) => ({
+    _id: a._id.toString(),
+    title: a.title,
+    description: a.description,
+    estimatedCostUSD: a.estimatedCostUSD,
+    timeOfDay: a.timeOfDay,
+    lat: a.lat,
+    lng: a.lng,
+  }));
+
+  console.log(`[Trip] Regenerating day ${dayNumber} of trip ${tripId}...`);
+
+  // Call Gemini with the full itinerary context
+  const newActivities = await regenerateDayActivities({
+    destination: trip.destination,
+    durationDays: trip.durationDays,
+    budgetTier: trip.budgetTier,
+    interests: trip.interests,
+    fullItinerary: trip.itinerary.map((d) => ({
+      dayNumber: d.dayNumber,
+      activities: d.activities.map((a) => ({ title: a.title, timeOfDay: a.timeOfDay })),
+    })),
+    dayNumber,
+    userFeedback: userFeedback?.trim(),
+    riskContext: riskContext?.trim(),
+  });
+
+  // Replace activities on the day subdocument
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  day.activities = newActivities as any;
+  await trip.save();
+
+  // Reload to get fresh Mongoose-assigned _ids on the new subdocs
+  const updated = await Trip.findById(trip._id);
+  const updatedDay = updated!.itinerary.find((d) => d.dayNumber === dayNumber)!;
+
+  const after: DayDiff['after'] = updatedDay.activities.map((a) => ({
+    _id: a._id.toString(),
+    title: a.title,
+    description: a.description,
+    estimatedCostUSD: a.estimatedCostUSD,
+    timeOfDay: a.timeOfDay,
+    lat: a.lat,
+    lng: a.lng,
+  }));
+
+  // All new activities are "changed" — highlight all of them
+  const changedActivityIds = (after as Array<ActivityShape & { _id: string }>).map((a) => a._id);
+
+  const diff: DayDiff = { dayNumber, before, after, changedActivityIds };
+
+  console.log(`[Trip] Regenerated day ${dayNumber}: ${before.length} → ${after.length} activities`);
+  res.status(200).json({ trip: updated, diff });
 });

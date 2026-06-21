@@ -318,6 +318,140 @@ export async function generateItinerary(
     return retryValidation.data;
   }
 
+
   console.log(`[Gemini] Validation passed ✓ — ${validation.data.itinerary.length} days generated`);
   return validation.data;
+}
+
+// ─── Single-day regeneration ──────────────────────────────────────────────────
+
+/** Zod schema for validating a single regenerated day (activities array only) */
+export const RegenerateDayResponseZ = z.object({
+  activities: z.array(ActivityZ).min(1).max(4),
+});
+
+export type RegenerateDayResponse = z.infer<typeof RegenerateDayResponseZ>;
+
+interface RegenerateDayParams {
+  destination: string;
+  durationDays: number;
+  budgetTier: 'Low' | 'Medium' | 'High';
+  interests: string[];
+  /** Full itinerary context — prevents Gemini from duplicating activities */
+  fullItinerary: Array<{ dayNumber: number; activities: Array<{ title: string; timeOfDay: string }> }>;
+  dayNumber: number;
+  userFeedback?: string;
+  riskContext?: string;
+}
+
+function buildRegenerateDayPrompt(params: RegenerateDayParams, isRetry = false): string {
+  const { destination, budgetTier, interests, fullItinerary, dayNumber, userFeedback, riskContext } = params;
+  const budgetGuidance = BUDGET_GUIDANCE[budgetTier];
+
+  const otherDays = fullItinerary
+    .filter((d) => d.dayNumber !== dayNumber)
+    .map((d) => `  Day ${d.dayNumber}: ${d.activities.map((a) => a.title).join(' / ')}`)
+    .join('\n');
+
+  const currentDayActivities = fullItinerary
+    .find((d) => d.dayNumber === dayNumber)
+    ?.activities.map((a) => `  - ${a.title} (${a.timeOfDay})`)
+    .join('\n') ?? '  (none)';
+
+  const feedbackLines = [
+    userFeedback ? `User feedback: "${userFeedback}"` : '',
+    riskContext ? `Risk context to address: "${riskContext}"` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const retryPrefix = isRetry
+    ? 'IMPORTANT: Your previous response failed schema validation. Return ONLY the JSON object with an "activities" array.\n\n'
+    : '';
+
+  return `${retryPrefix}You are an expert travel planner. Regenerate ONLY the activities for Day ${dayNumber} of a trip to ${destination}.
+
+Trip context:
+- Budget: ${budgetTier} (${budgetGuidance})
+- Interests: ${interests.join(', ')}
+- Total trip duration: ${params.durationDays} days
+
+Activities on OTHER days (do NOT repeat these):
+${otherDays || '  (no other days)'}
+
+Current Day ${dayNumber} activities being replaced:
+${currentDayActivities}
+
+Instructions to apply:
+${feedbackLines}
+
+Generate 2–4 completely NEW activities for Day ${dayNumber} that:
+1. Directly address the feedback/risk context above
+2. Do NOT duplicate any activity from other days
+3. Include realistic approximate GPS coordinates for each specific venue
+4. Stay within the ${budgetTier} budget tier
+5. Spread across different times of day (Morning / Afternoon / Evening)
+6. Use specific, real venue names — no generic descriptions
+
+Respond with ONLY this JSON (no markdown fences, no explanation):
+{
+  "activities": [
+    {
+      "title": "string",
+      "description": "string (2–3 sentences, specific details)",
+      "estimatedCostUSD": number,
+      "timeOfDay": "Morning" | "Afternoon" | "Evening",
+      "lat": number,
+      "lng": number
+    }
+  ]
+}`;
+}
+
+/**
+ * regenerateDayActivities — replaces one day's activities via Gemini.
+ * Validates with RegenerateDayResponseZ; one Zod-failure retry.
+ */
+export async function regenerateDayActivities(
+  params: RegenerateDayParams
+): Promise<RegenerateDayResponse['activities']> {
+  const rawText = await withExponentialBackoff(
+    () => callGemini(buildRegenerateDayPrompt(params, false)),
+    'Gemini-Regen'
+  );
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    console.warn('[Gemini-Regen] JSON parse failed — retrying');
+    const retryText = await withExponentialBackoff(
+      () => callGemini(buildRegenerateDayPrompt(params, true)),
+      'Gemini-Regen-Retry'
+    );
+    try { parsed = JSON.parse(retryText); }
+    catch { throw new AppError('Failed to regenerate the day. Please try again.', 502); }
+  }
+
+  const validation = RegenerateDayResponseZ.safeParse(parsed);
+  if (!validation.success) {
+    const issues = validation.error.issues.map((i) => i.message).join('; ');
+    console.warn(`[Gemini-Regen] Zod failed: ${issues} — retrying`);
+
+    const retryText = await withExponentialBackoff(
+      () => callGemini(buildRegenerateDayPrompt(params, true)),
+      'Gemini-Regen-ZodRetry'
+    );
+    let retryParsed: unknown;
+    try { retryParsed = JSON.parse(retryText); }
+    catch { throw new AppError('Failed to regenerate the day. Please try again.', 502); }
+
+    const retryV = RegenerateDayResponseZ.safeParse(retryParsed);
+    if (!retryV.success) throw new AppError('AI generated an invalid day structure. Please try again.', 502);
+    console.log('[Gemini-Regen] Retry validation passed ✓');
+    return retryV.data.activities;
+  }
+
+  console.log(`[Gemini-Regen] Validation passed ✓ — ${validation.data.activities.length} activities`);
+  return validation.data.activities;
 }
