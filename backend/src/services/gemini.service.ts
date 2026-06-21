@@ -360,7 +360,7 @@ function buildRegenerateDayPrompt(params: RegenerateDayParams, isRetry = false):
 
   const feedbackLines = [
     userFeedback ? `User feedback: "${userFeedback}"` : '',
-    riskContext ? `Risk context to address: "${riskContext}"` : '',
+    riskContext ? `Risk issue to resolve: "${riskContext}"` : '',
   ]
     .filter(Boolean)
     .join('\n');
@@ -369,6 +369,49 @@ function buildRegenerateDayPrompt(params: RegenerateDayParams, isRetry = false):
     ? 'IMPORTANT: Your previous response failed schema validation. Return ONLY the JSON object with an "activities" array.\n\n'
     : '';
 
+  // ── Targeted risk-fix prompt (Section E #3) — used when riskContext is present ──
+  if (riskContext && !userFeedback) {
+    return `${retryPrefix}You are a travel risk analyst and itinerary optimizer. A risk flag has been detected on Day ${dayNumber} of a trip to ${destination}:
+
+RISK ISSUE: "${riskContext}"
+
+Your task: replace Day ${dayNumber}'s activities with a set that RESOLVES this specific risk while keeping the trip enjoyable.
+
+Trip context:
+- Budget: ${budgetTier} (${budgetGuidance})
+- Interests: ${interests.join(', ')}
+- Duration: ${params.durationDays} days
+
+Other days (do NOT duplicate any of these activities):
+${otherDays || '  (no other days)'}
+
+Current Day ${dayNumber} activities being replaced:
+${currentDayActivities}
+
+Resolution requirements:
+1. If this is a PACING risk: choose venues that are geographically clustered (within 5 km of each other) to eliminate transit problems.
+2. If this is a BUDGET risk: replace costly activities with free or low-cost alternatives that still match interests.
+3. If this is a WEATHER risk: choose indoor or weather-proof venues (museums, galleries, covered markets, etc.).
+4. Every activity must include real GPS coordinates (lat/lng).
+5. Do NOT repeat any activity from other days.
+6. Keep 2–4 activities across Morning / Afternoon / Evening.
+
+Respond with ONLY this JSON (no markdown):
+{
+  "activities": [
+    {
+      "title": "string",
+      "description": "string (2–3 sentences explaining how this resolves the risk)",
+      "estimatedCostUSD": number,
+      "timeOfDay": "Morning" | "Afternoon" | "Evening",
+      "lat": number,
+      "lng": number
+    }
+  ]
+}`;
+  }
+
+  // ── General regeneration prompt — used when only userFeedback is present ──
   return `${retryPrefix}You are an expert travel planner. Regenerate ONLY the activities for Day ${dayNumber} of a trip to ${destination}.
 
 Trip context:

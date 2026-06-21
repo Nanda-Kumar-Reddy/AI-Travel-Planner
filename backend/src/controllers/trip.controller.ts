@@ -4,123 +4,137 @@ import { Trip } from '../models/Trip';
 import { AppError, catchAsync } from '../utils/errors';
 import { getAuthUser } from '../types/auth.helpers';
 import { geocodeDestination } from '../services/geocoding.service';
-import { generateItinerary, regenerateDayActivities, generateBudgetEstimate, generateHotelSuggestions } from '../services/gemini.service';
+import {
+  generateItinerary,
+  regenerateDayActivities,
+  generateBudgetEstimate,
+  generateHotelSuggestions,
+} from '../services/gemini.service';
+import { runRiskPass } from '../services/risk.service';
 import type { DayDiff, ActivityShape } from '../types/trip.types';
 
+// ─── Risk-pass helper ─────────────────────────────────────────────────────────
+// applyRiskPass is typed with `any` to sidestep Mongoose's opaque HydratedDocument
+// generic, which causes save() return-type conflicts with any manually defined interface.
+// The eslint suppression is isolated to this one function.
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function applyRiskPass(trip: any): Promise<void> {
+  try {
+    const result = await runRiskPass({
+      destination: String(trip.destination),
+      durationDays: Number(trip.durationDays),
+      budgetTier: trip.budgetTier as 'Low' | 'Medium' | 'High',
+      startDate: trip.startDate as Date | null | undefined,
+      destinationLat: trip.destinationLat as number | null | undefined,
+      destinationLng: trip.destinationLng as number | null | undefined,
+      itinerary: (trip.itinerary as Array<{
+        dayNumber: number;
+        activities: Array<{ title: string; estimatedCostUSD: number; lat?: number; lng?: number }>;
+      }>).map((d) => ({
+        dayNumber: d.dayNumber,
+        activities: d.activities.map((a) => ({
+          title: a.title,
+          estimatedCostUSD: a.estimatedCostUSD,
+          lat: a.lat,
+          lng: a.lng,
+        })),
+      })),
+      estimatedBudget: trip.estimatedBudget as {
+        transport: number; accommodation: number; food: number; activities: number; total: number;
+      } | null | undefined,
+    } satisfies import('../services/risk.service').TripInput);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    trip.riskFlags = result.riskFlags as any;
+    trip.confidenceScore = result.confidenceScore;
+    await trip.save();
+  } catch (err) {
+    console.error('[Risk] applyRiskPass failed (non-fatal):', String(err));
+  }
+}
+
+
 // ─── POST /api/trips ──────────────────────────────────────────────────────────
-// Synchronous: geocode → generate → validate → save → respond (Issue-3 amendment)
 export const createTrip = catchAsync(async (req: Request, res: Response): Promise<void> => {
   const { id: userId } = getAuthUser(req);
 
-  const {
-    destination,
-    durationDays,
-    budgetTier,
-    interests,
-    startDate,
-  } = req.body as {
-    destination?: string;
-    durationDays?: number;
-    budgetTier?: string;
-    interests?: string[];
-    startDate?: string | null;
+  const { destination, durationDays, budgetTier, interests, startDate } = req.body as {
+    destination?: string; durationDays?: number; budgetTier?: string;
+    interests?: string[]; startDate?: string|null;
   };
 
-  // ── Input validation ───────────────────────────────────────────────────────
   if (!destination?.trim()) throw new AppError('Destination is required.', 400);
-  if (!durationDays || durationDays < 1 || durationDays > 30) {
+  if (!durationDays || durationDays < 1 || durationDays > 30)
     throw new AppError('Duration must be between 1 and 30 days.', 400);
-  }
-  if (!['Low', 'Medium', 'High'].includes(budgetTier ?? '')) {
+  if (!['Low', 'Medium', 'High'].includes(budgetTier ?? ''))
     throw new AppError('Budget tier must be Low, Medium, or High.', 400);
-  }
-  if (!Array.isArray(interests) || interests.length === 0) {
+  if (!Array.isArray(interests) || interests.length === 0)
     throw new AppError('At least one interest is required.', 400);
-  }
 
-  const safeInterests = interests
-    .map((i) => String(i).trim())
-    .filter(Boolean)
-    .slice(0, 10); // cap at 10
+  const safeInterests = interests.map((i) => String(i).trim()).filter(Boolean).slice(0, 10);
 
-  // ── Step 1: Geocode destination ────────────────────────────────────────────
   console.log(`[Trip] Geocoding "${destination}"...`);
-  const geoResult = await geocodeDestination(destination);
-  if (geoResult) {
-    console.log(`[Trip] Geocoded to (${geoResult.lat}, ${geoResult.lng}) — ${geoResult.resolvedName}`);
-  } else {
-    console.warn(`[Trip] Geocoding failed for "${destination}" — coordinates will be null`);
-  }
+  const geo = await geocodeDestination(destination);
+  if (geo) console.log(`[Trip] Geocoded → (${geo.lat}, ${geo.lng}) ${geo.resolvedName}`);
+  else console.warn(`[Trip] Geocoding failed for "${destination}" — coordinates will be null`);
 
-  // ── Step 2: Generate itinerary via Gemini ──────────────────────────────────
-  console.log(`[Trip] Generating itinerary for "${destination}" (${durationDays}d, ${budgetTier})...`);
+  console.log(`[Trip] Generating itinerary...`);
   const generated = await generateItinerary({
-    destination: geoResult?.resolvedName ?? destination,
+    destination: geo?.resolvedName ?? destination,
     durationDays: Number(durationDays),
     budgetTier: budgetTier as 'Low' | 'Medium' | 'High',
     interests: safeInterests,
     startDate: startDate ?? null,
   });
 
-  // ── Step 3: Save to MongoDB ────────────────────────────────────────────────
-  const trip = await Trip.create({
+  const created = await Trip.create({
     userId: new mongoose.Types.ObjectId(userId),
     destination: destination.trim(),
     startDate: startDate ? new Date(startDate) : null,
     durationDays: Number(durationDays),
     budgetTier,
     interests: safeInterests,
-    destinationLat: geoResult?.lat ?? undefined,
-    destinationLng: geoResult?.lng ?? undefined,
+    destinationLat: geo?.lat,
+    destinationLng: geo?.lng,
     itinerary: generated.itinerary,
     hotels: generated.hotels,
     estimatedBudget: generated.estimatedBudget,
-    confidenceScore: 100, // Phase 8 will compute this from risk flags
+    confidenceScore: 100,
     riskFlags: [],
     status: 'ready',
   });
 
-  console.log(`[Trip] Created trip ${trip._id} for user ${userId}`);
-  res.status(201).json({ trip });
+  // Reload for clean HydratedDocument, then run risk pass
+  const loaded = await Trip.findById(created._id);
+  if (!loaded) throw new AppError('Failed to load created trip.', 500);
+  await applyRiskPass(loaded);
+
+  console.log(`[Trip] Created ${loaded._id} — score ${loaded.confidenceScore}`);
+  res.status(201).json({ trip: loaded });
 });
 
 // ─── GET /api/trips ───────────────────────────────────────────────────────────
-// Returns only summary fields (no full itinerary) to keep the list fast
 export const getTrips = catchAsync(async (req: Request, res: Response): Promise<void> => {
   const { id: userId } = getAuthUser(req);
-
   const trips = await Trip.find({ userId })
-    .select('destination durationDays budgetTier confidenceScore status startDate createdAt updatedAt')
+    .select('destination durationDays budgetTier confidenceScore riskFlags status startDate estimatedBudget createdAt updatedAt')
     .sort({ createdAt: -1 });
-
   res.status(200).json({ trips });
 });
 
 // ─── GET /api/trips/:id ───────────────────────────────────────────────────────
 export const getTripById = catchAsync(async (req: Request, res: Response): Promise<void> => {
   const { id: userId } = getAuthUser(req);
-  const { id: tripId } = req.params;
-
-  const trip = await Trip.findOne({ _id: tripId, userId });
-  if (!trip) {
-    // Same 404 whether the trip doesn't exist OR belongs to another user
-    // Never reveal that a resource exists but is forbidden (prevents enumeration)
-    throw new AppError('Trip not found.', 404);
-  }
-
+  const trip = await Trip.findOne({ _id: req.params.id, userId });
+  if (!trip) throw new AppError('Trip not found.', 404);
   res.status(200).json({ trip });
 });
 
 // ─── DELETE /api/trips/:id ────────────────────────────────────────────────────
 export const deleteTrip = catchAsync(async (req: Request, res: Response): Promise<void> => {
   const { id: userId } = getAuthUser(req);
-  const { id: tripId } = req.params;
-
-  const trip = await Trip.findOneAndDelete({ _id: tripId, userId });
-  if (!trip) {
-    throw new AppError('Trip not found.', 404);
-  }
-
+  const trip = await Trip.findOneAndDelete({ _id: req.params.id, userId });
+  if (!trip) throw new AppError('Trip not found.', 404);
   res.status(200).json({ message: 'Trip deleted successfully.' });
 });
 
@@ -129,31 +143,23 @@ export const addActivity = catchAsync(async (req: Request, res: Response): Promi
   const { id: userId } = getAuthUser(req);
   const { id: tripId, dayNumber: dayNumberStr } = req.params;
   const dayNumber = parseInt(dayNumberStr, 10);
-
   if (isNaN(dayNumber)) throw new AppError('Invalid day number.', 400);
 
   const { title, description, estimatedCostUSD, timeOfDay, lat, lng } = req.body as {
-    title?: string;
-    description?: string;
-    estimatedCostUSD?: number;
-    timeOfDay?: string;
-    lat?: number;
-    lng?: number;
+    title?: string; description?: string; estimatedCostUSD?: number;
+    timeOfDay?: string; lat?: number; lng?: number;
   };
 
   if (!title?.trim()) throw new AppError('Activity title is required.', 400);
-  if (!['Morning', 'Afternoon', 'Evening'].includes(timeOfDay ?? '')) {
+  if (!['Morning', 'Afternoon', 'Evening'].includes(timeOfDay ?? ''))
     throw new AppError('timeOfDay must be Morning, Afternoon, or Evening.', 400);
-  }
 
-  // Ownership check — same { _id, userId } pattern as all other routes
   const trip = await Trip.findOne({ _id: tripId, userId });
   if (!trip) throw new AppError('Trip not found.', 404);
 
   const day = trip.itinerary.find((d) => d.dayNumber === dayNumber);
   if (!day) throw new AppError(`Day ${dayNumber} not found on this trip.`, 404);
 
-  // Double-cast: IActivity[] → unknown → any to satisfy Mongoose's DocumentArray push
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (day.activities as unknown as any[]).push({
     title: title.trim(),
@@ -165,7 +171,8 @@ export const addActivity = catchAsync(async (req: Request, res: Response): Promi
   });
 
   await trip.save();
-  console.log(`[Trip] Added activity to day ${dayNumber} of trip ${tripId}`);
+  await applyRiskPass(trip);
+  console.log(`[Trip] Added activity to day ${dayNumber} — score now ${trip.confidenceScore}`);
   res.status(201).json({ trip });
 });
 
@@ -174,7 +181,6 @@ export const removeActivity = catchAsync(async (req: Request, res: Response): Pr
   const { id: userId } = getAuthUser(req);
   const { id: tripId, dayNumber: dayNumberStr, activityId } = req.params;
   const dayNumber = parseInt(dayNumberStr, 10);
-
   if (isNaN(dayNumber)) throw new AppError('Invalid day number.', 400);
 
   const trip = await Trip.findOne({ _id: tripId, userId });
@@ -183,15 +189,13 @@ export const removeActivity = catchAsync(async (req: Request, res: Response): Pr
   const day = trip.itinerary.find((d) => d.dayNumber === dayNumber);
   if (!day) throw new AppError(`Day ${dayNumber} not found on this trip.`, 404);
 
-  const activityIndex = day.activities.findIndex(
-    (a) => a._id.toString() === activityId
-  );
-  if (activityIndex === -1) throw new AppError('Activity not found.', 404);
+  const idx = day.activities.findIndex((a) => a._id.toString() === activityId);
+  if (idx === -1) throw new AppError('Activity not found.', 404);
 
-  day.activities.splice(activityIndex, 1);
+  day.activities.splice(idx, 1);
   await trip.save();
-
-  console.log(`[Trip] Removed activity ${activityId} from day ${dayNumber} of trip ${tripId}`);
+  await applyRiskPass(trip);
+  console.log(`[Trip] Removed activity ${activityId} — score now ${trip.confidenceScore}`);
   res.status(200).json({ trip });
 });
 
@@ -200,39 +204,24 @@ export const regenerateDay = catchAsync(async (req: Request, res: Response): Pro
   const { id: userId } = getAuthUser(req);
   const { id: tripId, dayNumber: dayNumberStr } = req.params;
   const dayNumber = parseInt(dayNumberStr, 10);
-
   if (isNaN(dayNumber)) throw new AppError('Invalid day number.', 400);
 
-  const { userFeedback, riskContext } = req.body as {
-    userFeedback?: string;
-    riskContext?: string;
-  };
+  const { userFeedback, riskContext } = req.body as { userFeedback?: string; riskContext?: string };
 
-  if (!userFeedback?.trim() && !riskContext?.trim()) {
+  if (!userFeedback?.trim() && !riskContext?.trim())
     throw new AppError('At least userFeedback or riskContext is required.', 400);
-  }
 
-  // Ownership check
   const trip = await Trip.findOne({ _id: tripId, userId });
   if (!trip) throw new AppError('Trip not found.', 404);
 
   const day = trip.itinerary.find((d) => d.dayNumber === dayNumber);
   if (!day) throw new AppError(`Day ${dayNumber} not found on this trip.`, 404);
 
-  // Capture the "before" state before any mutation
   const before: DayDiff['before'] = day.activities.map((a) => ({
-    _id: a._id.toString(),
-    title: a.title,
-    description: a.description,
-    estimatedCostUSD: a.estimatedCostUSD,
-    timeOfDay: a.timeOfDay,
-    lat: a.lat,
-    lng: a.lng,
+    _id: a._id.toString(), title: a.title, description: a.description,
+    estimatedCostUSD: a.estimatedCostUSD, timeOfDay: a.timeOfDay, lat: a.lat, lng: a.lng,
   }));
 
-  console.log(`[Trip] Regenerating day ${dayNumber} of trip ${tripId}...`);
-
-  // Call Gemini with the full itinerary context
   const newActivities = await regenerateDayActivities({
     destination: trip.destination,
     durationDays: trip.durationDays,
@@ -247,62 +236,43 @@ export const regenerateDay = catchAsync(async (req: Request, res: Response): Pro
     riskContext: riskContext?.trim(),
   });
 
-  // Replace activities on the day subdocument
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   day.activities = newActivities as any;
   await trip.save();
 
-  // Reload to get fresh Mongoose-assigned _ids on the new subdocs
-  const updated = await Trip.findById(trip._id);
-  const updatedDay = updated!.itinerary.find((d) => d.dayNumber === dayNumber)!;
+  const reloaded = await Trip.findById(trip._id);
+  if (!reloaded) throw new AppError('Trip reload failed after regeneration.', 500);
 
+  const updatedDay = reloaded.itinerary.find((d) => d.dayNumber === dayNumber)!;
   const after: DayDiff['after'] = updatedDay.activities.map((a) => ({
-    _id: a._id.toString(),
-    title: a.title,
-    description: a.description,
-    estimatedCostUSD: a.estimatedCostUSD,
-    timeOfDay: a.timeOfDay,
-    lat: a.lat,
-    lng: a.lng,
+    _id: a._id.toString(), title: a.title, description: a.description,
+    estimatedCostUSD: a.estimatedCostUSD, timeOfDay: a.timeOfDay, lat: a.lat, lng: a.lng,
   }));
-
-  // All new activities are "changed" — highlight all of them
   const changedActivityIds = (after as Array<ActivityShape & { _id: string }>).map((a) => a._id);
-
   const diff: DayDiff = { dayNumber, before, after, changedActivityIds };
 
-  console.log(`[Trip] Regenerated day ${dayNumber}: ${before.length} → ${after.length} activities`);
-  res.status(200).json({ trip: updated, diff });
+  await applyRiskPass(reloaded);
+  console.log(`[Trip] Regenerated day ${dayNumber} — score now ${reloaded.confidenceScore}`);
+  res.status(200).json({ trip: reloaded, diff });
 });
 
 // ─── POST /api/trips/:id/budget/refresh ───────────────────────────────────────
 export const refreshBudget = catchAsync(async (req: Request, res: Response): Promise<void> => {
   const { id: userId } = getAuthUser(req);
-  const { id: tripId } = req.params;
-
-  const trip = await Trip.findOne({ _id: tripId, userId });
+  const trip = await Trip.findOne({ _id: req.params.id, userId });
   if (!trip) throw new AppError('Trip not found.', 404);
 
-  // Compute actual activities cost from the stored itinerary
   const activitiesTotalCost = trip.itinerary.reduce(
-    (daySum, day) =>
-      daySum + day.activities.reduce((actSum, act) => actSum + act.estimatedCostUSD, 0),
-    0
+    (ds, d) => ds + d.activities.reduce((as, a) => as + a.estimatedCostUSD, 0), 0
   );
 
-  console.log(`[Trip] Refreshing budget for trip ${tripId}, activities cost: $${activitiesTotalCost}`);
-
   const estimatedBudget = await generateBudgetEstimate({
-    destination: trip.destination,
-    durationDays: trip.durationDays,
-    budgetTier: trip.budgetTier,
-    interests: trip.interests,
-    activitiesTotalCost,
+    destination: trip.destination, durationDays: trip.durationDays,
+    budgetTier: trip.budgetTier, interests: trip.interests, activitiesTotalCost,
   });
 
   trip.estimatedBudget = estimatedBudget;
   await trip.save();
-
   console.log(`[Trip] Budget refreshed — total $${estimatedBudget.total}`);
   res.status(200).json({ estimatedBudget });
 });
@@ -310,23 +280,27 @@ export const refreshBudget = catchAsync(async (req: Request, res: Response): Pro
 // ─── POST /api/trips/:id/hotels ───────────────────────────────────────────────
 export const refreshHotels = catchAsync(async (req: Request, res: Response): Promise<void> => {
   const { id: userId } = getAuthUser(req);
-  const { id: tripId } = req.params;
-
-  const trip = await Trip.findOne({ _id: tripId, userId });
+  const trip = await Trip.findOne({ _id: req.params.id, userId });
   if (!trip) throw new AppError('Trip not found.', 404);
 
-  console.log(`[Trip] Refreshing hotels for trip ${tripId} (${trip.destination})`);
-
   const hotels = await generateHotelSuggestions({
-    destination: trip.destination,
-    durationDays: trip.durationDays,
-    budgetTier: trip.budgetTier,
+    destination: trip.destination, durationDays: trip.durationDays, budgetTier: trip.budgetTier,
   });
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   trip.hotels = hotels as any;
   await trip.save();
-
   console.log(`[Trip] Hotels refreshed — ${hotels.length} suggestions`);
   res.status(200).json({ hotels });
+});
+
+// ─── POST /api/trips/:id/risk ─────────────────────────────────────────────────
+export const refreshRisk = catchAsync(async (req: Request, res: Response): Promise<void> => {
+  const { id: userId } = getAuthUser(req);
+  const trip = await Trip.findOne({ _id: req.params.id, userId });
+  if (!trip) throw new AppError('Trip not found.', 404);
+
+  await applyRiskPass(trip);
+  console.log(`[Trip] Manual risk refresh — score ${trip.confidenceScore}`);
+  res.status(200).json({ confidenceScore: trip.confidenceScore, riskFlags: trip.riskFlags });
 });

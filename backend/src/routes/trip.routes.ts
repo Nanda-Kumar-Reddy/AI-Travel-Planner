@@ -10,11 +10,11 @@ import {
   regenerateDay,
   refreshBudget,
   refreshHotels,
+  refreshRisk,
 } from '../controllers/trip.controller';
 
 const router = Router();
 
-// All trip routes protected — requireAuth at router level
 router.use(requireAuth);
 
 // ── Phase 3 ──────────────────────────────────────────────────────────────────
@@ -32,7 +32,7 @@ router.post('/:id/days/:dayNumber/regenerate', regenerateDay);
 router.post('/:id/budget/refresh', refreshBudget);
 router.post('/:id/hotels', refreshHotels);
 
-// ── Phase 8 (risk engine) ─────────────────────────────────────────────────────
-// router.post('/:id/risk', runRiskPass);
+// ── Phase 6 — Risk engine ────────────────────────────────────────────────────
+router.post('/:id/risk', refreshRisk);
 
 export default router;
