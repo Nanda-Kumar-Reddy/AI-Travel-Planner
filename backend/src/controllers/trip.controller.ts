@@ -4,7 +4,7 @@ import { Trip } from '../models/Trip';
 import { AppError, catchAsync } from '../utils/errors';
 import { getAuthUser } from '../types/auth.helpers';
 import { geocodeDestination } from '../services/geocoding.service';
-import { generateItinerary, regenerateDayActivities } from '../services/gemini.service';
+import { generateItinerary, regenerateDayActivities, generateBudgetEstimate, generateHotelSuggestions } from '../services/gemini.service';
 import type { DayDiff, ActivityShape } from '../types/trip.types';
 
 // ─── POST /api/trips ──────────────────────────────────────────────────────────
@@ -273,4 +273,60 @@ export const regenerateDay = catchAsync(async (req: Request, res: Response): Pro
 
   console.log(`[Trip] Regenerated day ${dayNumber}: ${before.length} → ${after.length} activities`);
   res.status(200).json({ trip: updated, diff });
+});
+
+// ─── POST /api/trips/:id/budget/refresh ───────────────────────────────────────
+export const refreshBudget = catchAsync(async (req: Request, res: Response): Promise<void> => {
+  const { id: userId } = getAuthUser(req);
+  const { id: tripId } = req.params;
+
+  const trip = await Trip.findOne({ _id: tripId, userId });
+  if (!trip) throw new AppError('Trip not found.', 404);
+
+  // Compute actual activities cost from the stored itinerary
+  const activitiesTotalCost = trip.itinerary.reduce(
+    (daySum, day) =>
+      daySum + day.activities.reduce((actSum, act) => actSum + act.estimatedCostUSD, 0),
+    0
+  );
+
+  console.log(`[Trip] Refreshing budget for trip ${tripId}, activities cost: $${activitiesTotalCost}`);
+
+  const estimatedBudget = await generateBudgetEstimate({
+    destination: trip.destination,
+    durationDays: trip.durationDays,
+    budgetTier: trip.budgetTier,
+    interests: trip.interests,
+    activitiesTotalCost,
+  });
+
+  trip.estimatedBudget = estimatedBudget;
+  await trip.save();
+
+  console.log(`[Trip] Budget refreshed — total $${estimatedBudget.total}`);
+  res.status(200).json({ estimatedBudget });
+});
+
+// ─── POST /api/trips/:id/hotels ───────────────────────────────────────────────
+export const refreshHotels = catchAsync(async (req: Request, res: Response): Promise<void> => {
+  const { id: userId } = getAuthUser(req);
+  const { id: tripId } = req.params;
+
+  const trip = await Trip.findOne({ _id: tripId, userId });
+  if (!trip) throw new AppError('Trip not found.', 404);
+
+  console.log(`[Trip] Refreshing hotels for trip ${tripId} (${trip.destination})`);
+
+  const hotels = await generateHotelSuggestions({
+    destination: trip.destination,
+    durationDays: trip.durationDays,
+    budgetTier: trip.budgetTier,
+  });
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  trip.hotels = hotels as any;
+  await trip.save();
+
+  console.log(`[Trip] Hotels refreshed — ${hotels.length} suggestions`);
+  res.status(200).json({ hotels });
 });

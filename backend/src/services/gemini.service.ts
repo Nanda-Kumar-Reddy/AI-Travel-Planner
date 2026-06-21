@@ -455,3 +455,176 @@ export async function regenerateDayActivities(
   console.log(`[Gemini-Regen] Validation passed ✓ — ${validation.data.activities.length} activities`);
   return validation.data.activities;
 }
+
+// ─── Budget estimation (standalone refresh) ───────────────────────────────────
+
+export const BudgetRefreshResponseZ = EstimatedBudgetZ;
+export type BudgetRefreshResponse = z.infer<typeof BudgetRefreshResponseZ>;
+
+interface BudgetEstimateParams {
+  destination: string;
+  durationDays: number;
+  budgetTier: 'Low' | 'Medium' | 'High';
+  interests: string[];
+  /** Sum of estimatedCostUSD across all planned activities — pinned into the response */
+  activitiesTotalCost: number;
+}
+
+function buildBudgetPrompt(params: BudgetEstimateParams, isRetry = false): string {
+  const { destination, durationDays, budgetTier, interests, activitiesTotalCost } = params;
+  const budgetGuidance = BUDGET_GUIDANCE[budgetTier];
+  const retryPrefix = isRetry
+    ? 'IMPORTANT: Your previous response failed schema validation. Return ONLY the JSON object.\n\n'
+    : '';
+
+  return `${retryPrefix}You are a travel budget expert. Estimate the full trip cost breakdown for:
+- Destination: ${destination}
+- Duration: ${durationDays} days
+- Budget tier: ${budgetTier} (${budgetGuidance})
+- Traveller interests: ${interests.join(', ')}
+- Planned activities cost (already computed): $${activitiesTotalCost} USD — use this exact number for "activities"
+
+Estimate realistic USD amounts for the remaining categories:
+- transport: round-trip flights/trains to ${destination} from a major hub (economy for Budget, business for Luxury)
+- accommodation: total hotel cost for ${durationDays - 1} nights (use ${budgetTier} tier pricing)
+- food: total meal costs for ${durationDays} days per person
+- activities: MUST equal exactly ${activitiesTotalCost}
+- total: MUST equal transport + accommodation + food + activities
+
+Respond with ONLY valid JSON (no markdown):
+{
+  "transport": number,
+  "accommodation": number,
+  "food": number,
+  "activities": ${activitiesTotalCost},
+  "total": number
+}`;
+}
+
+/**
+ * generateBudgetEstimate — refreshes the trip budget via Gemini.
+ * Pins the activities cost to the passed activitiesTotalCost; estimates the rest.
+ */
+export async function generateBudgetEstimate(
+  params: BudgetEstimateParams
+): Promise<BudgetRefreshResponse> {
+  const rawText = await withExponentialBackoff(
+    () => callGemini(buildBudgetPrompt(params, false)),
+    'Gemini-Budget'
+  );
+
+  let parsed: unknown;
+  try { parsed = JSON.parse(rawText); }
+  catch {
+    const retry = await withExponentialBackoff(
+      () => callGemini(buildBudgetPrompt(params, true)),
+      'Gemini-Budget-Retry'
+    );
+    try { parsed = JSON.parse(retry); }
+    catch { throw new AppError('Failed to estimate budget. Please try again.', 502); }
+  }
+
+  const v = BudgetRefreshResponseZ.safeParse(parsed);
+  if (!v.success) {
+    const issues = v.error.issues.map((i) => i.message).join('; ');
+    console.warn(`[Gemini-Budget] Zod failed: ${issues}`);
+    throw new AppError('AI returned an invalid budget structure. Please try again.', 502);
+  }
+
+  // Force-pin activities to the passed value to prevent Gemini from drifting
+  v.data.activities = params.activitiesTotalCost;
+  v.data.total = v.data.transport + v.data.accommodation + v.data.food + v.data.activities;
+
+  console.log(`[Gemini-Budget] Estimate ready — total $${v.data.total}`);
+  return v.data;
+}
+
+// ─── Hotel suggestions (standalone refresh) ───────────────────────────────────
+
+export const HotelsRefreshResponseZ = z.object({
+  hotels: z.array(HotelZ).length(3),
+});
+export type HotelsRefreshResponse = z.infer<typeof HotelsRefreshResponseZ>;
+
+interface HotelSuggestionsParams {
+  destination: string;
+  durationDays: number;
+  budgetTier: 'Low' | 'Medium' | 'High';
+}
+
+function buildHotelsPrompt(params: HotelSuggestionsParams, isRetry = false): string {
+  const { destination, durationDays, budgetTier } = params;
+  const retryPrefix = isRetry
+    ? 'IMPORTANT: Your previous response failed schema validation. Return ONLY the JSON object with a "hotels" array of exactly 3 items.\n\n'
+    : '';
+
+  return `${retryPrefix}You are a hotel expert. Recommend exactly 3 real hotels in ${destination} for a ${durationDays}-night stay.
+
+Rules:
+- Exactly ONE hotel per tier: Budget, Mid-Range, Luxury (in that order in the array)
+- "tier" must be exactly one of: "Budget", "Mid-Range", "Luxury"
+- Use real hotel names — no fictional properties
+- pricePerNightUSD should reflect the ${budgetTier} traveller's preference but include all three tiers
+- rating must be between 1.0 and 5.0
+
+Respond with ONLY valid JSON (no markdown):
+{
+  "hotels": [
+    {
+      "name": "string",
+      "tier": "Budget",
+      "pricePerNightUSD": number,
+      "description": "string (2 sentences max)",
+      "rating": number
+    },
+    { "name": "...", "tier": "Mid-Range", ... },
+    { "name": "...", "tier": "Luxury", ... }
+  ]
+}`;
+}
+
+/**
+ * generateHotelSuggestions — returns exactly 3 hotels (one per tier) via Gemini.
+ * One Zod-failure retry included.
+ */
+export async function generateHotelSuggestions(
+  params: HotelSuggestionsParams
+): Promise<HotelsRefreshResponse['hotels']> {
+  const rawText = await withExponentialBackoff(
+    () => callGemini(buildHotelsPrompt(params, false)),
+    'Gemini-Hotels'
+  );
+
+  let parsed: unknown;
+  try { parsed = JSON.parse(rawText); }
+  catch {
+    const retry = await withExponentialBackoff(
+      () => callGemini(buildHotelsPrompt(params, true)),
+      'Gemini-Hotels-Retry'
+    );
+    try { parsed = JSON.parse(retry); }
+    catch { throw new AppError('Failed to generate hotel suggestions. Please try again.', 502); }
+  }
+
+  const v = HotelsRefreshResponseZ.safeParse(parsed);
+  if (!v.success) {
+    const issues = v.error.issues.map((i) => i.message).join('; ');
+    console.warn(`[Gemini-Hotels] Zod failed: ${issues} — retrying`);
+
+    const retry = await withExponentialBackoff(
+      () => callGemini(buildHotelsPrompt(params, true)),
+      'Gemini-Hotels-ZodRetry'
+    );
+    let retryParsed: unknown;
+    try { retryParsed = JSON.parse(retry); }
+    catch { throw new AppError('Failed to generate hotel suggestions. Please try again.', 502); }
+
+    const rv = HotelsRefreshResponseZ.safeParse(retryParsed);
+    if (!rv.success) throw new AppError('AI returned invalid hotel data. Please try again.', 502);
+    console.log('[Gemini-Hotels] Retry validation passed ✓');
+    return rv.data.hotels;
+  }
+
+  console.log(`[Gemini-Hotels] ${v.data.hotels.length} hotels validated ✓`);
+  return v.data.hotels;
+}
