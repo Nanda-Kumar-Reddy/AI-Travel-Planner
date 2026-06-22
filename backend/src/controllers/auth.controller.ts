@@ -11,21 +11,23 @@ const COOKIE_NAME = 'token';
 const COOKIE_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
 
 function setAuthCookie(res: Response, token: string): void {
+  const isProd = process.env.NODE_ENV === 'production';
   res.cookie(COOKIE_NAME, token, {
-    httpOnly: true, // Inaccessible to JavaScript — XSS protection
-    secure: process.env.NODE_ENV === 'production', // HTTPS only in production
-    sameSite: 'strict', // CSRF protection — not sent on cross-site requests
+    httpOnly: true,                        // XSS protection — JS cannot read it
+    secure: isProd,                        // HTTPS only in production
+    sameSite: isProd ? 'none' : 'lax',    // 'none' required for cross-origin (Vercel ↔ Render)
     maxAge: COOKIE_MAX_AGE,
     path: '/',
   });
 }
 
 function clearAuthCookie(res: Response): void {
+  const isProd = process.env.NODE_ENV === 'production';
   res.cookie(COOKIE_NAME, '', {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'strict',
-    maxAge: 0, // Expire immediately
+    secure: isProd,
+    sameSite: isProd ? 'none' : 'lax',
+    maxAge: 0,
     path: '/',
   });
 }
