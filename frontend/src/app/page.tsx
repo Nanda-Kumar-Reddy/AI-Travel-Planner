@@ -26,7 +26,7 @@ const featureCards = [
   {
     icon: Sparkles,
     title: 'AI-Generated Itineraries',
-    description: 'Gemini crafts day-by-day plans tailored to your interests, duration, and budget — in seconds.',
+    description: 'Trao crafts day-by-day plans tailored to your interests, duration, and budget — in seconds.',
   },
   {
     icon: Shield,
@@ -134,7 +134,7 @@ export default function HomePage() {
                   }}
                 >
                   <Sparkles size={11} />
-                  Powered by Gemini AI
+                  Powered by Trao AI
                 </span>
               </motion.div>
 
@@ -350,7 +350,7 @@ export default function HomePage() {
       >
         <div className="max-w-6xl mx-auto px-4 sm:px-6 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs">
           <span>© {new Date().getFullYear()} AI Travel Planner</span>
-          <span>Built with Gemini AI · Editorial Indigo design system</span>
+          <span>Built with Trao · Editorial Indigo design system</span>
         </div>
       </footer>
     </div>

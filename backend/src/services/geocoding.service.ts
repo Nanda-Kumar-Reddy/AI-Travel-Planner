@@ -5,6 +5,8 @@
  * API docs: https://open-meteo.com/en/docs/geocoding-api
  */
 
+import { logger } from '../utils/logger';
+
 interface GeocodingResult {
   lat: number;
   lng: number;
@@ -40,14 +42,14 @@ export async function geocodeDestination(
     });
 
     if (!response.ok) {
-      console.warn(`[Geocoding] API returned ${response.status} for "${destination}"`);
+      logger.warn(`[Geocoding] API returned ${response.status} for "${destination}"`);
       return null;
     }
 
     const data = (await response.json()) as OpenMeteoGeoResponse;
 
     if (!data.results || data.results.length === 0) {
-      console.warn(`[Geocoding] No results for "${destination}"`);
+      logger.warn(`[Geocoding] No results for "${destination}"`);
       return null;
     }
 
@@ -59,7 +61,7 @@ export async function geocodeDestination(
     };
   } catch (err) {
     // Network error, timeout, or JSON parse failure — degrade gracefully
-    console.warn(`[Geocoding] Failed to geocode "${destination}":`, err);
+    logger.warn(`[Geocoding] Failed to geocode "${destination}":`, err);
     return null;
   }
 }

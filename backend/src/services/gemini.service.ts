@@ -1,15 +1,32 @@
 /**
- * Gemini Service — AI itinerary generation with:
- *  - Primary model: gemini-2.5-flash-preview-09-2025
- *  - Fallback model: gemini-2.5-flash
- *  - Exponential backoff: 1s → 2s → 4s → 8s → 16s (5 retries max)
- *  - Zod validation on response before any DB write
- *  - One retry with "validation failed" prompt amendment on Zod failure
+ * Gemini Service — AI itinerary generation.
+ *
+ * Models (tried in order):
+ *   Primary:  gemini-2.5-flash-preview-05-20
+ *   Fallback: gemini-2.5-flash
+ *
+ * Retry strategy (withExponentialBackoff):
+ *   Up to 5 retries with delays 1s → 2s → 4s → 8s → 16s.
+ *   Retries on transient errors (network, timeout, server-side 5xx, 429).
+ *   Aborts immediately on non-retryable errors: invalid API key, safety blocks,
+ *   invalid argument — retrying those would never succeed.
+ *
+ * Error classification:
+ *   After exhausting retries, the error code from the Gemini SDK is inspected
+ *   and mapped to a specific AppError subtype so the controller always has
+ *   enough information to return the right user-facing message.
  */
 
 import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from '@google/generative-ai';
 import { z } from 'zod';
-import { AppError } from '../utils/errors';
+import {
+  AppError,
+  aiRateLimitedError,
+  aiUnreachableError,
+  aiInvalidOutputError,
+  aiAuthError,
+} from '../utils/errors';
+import { logger } from '../utils/logger';
 
 // ─── Zod schema for the Gemini response ──────────────────────────────────────
 
@@ -51,9 +68,11 @@ export const TripGenerationResponseZ = z.object({
 
 export type TripGenerationResponse = z.infer<typeof TripGenerationResponseZ>;
 
-// ─── Backoff helper ───────────────────────────────────────────────────────────
+// ─── Exponential backoff helper ───────────────────────────────────────────────
 
-const BACKOFF_DELAYS_MS = [1000, 2000, 4000, 8000, 16000]; // 1s → 16s
+// Delay schedule: 1s, 2s, 4s, 8s, 16s — gives the AI provider ~31s total
+// to recover from transient overload before we give up.
+const BACKOFF_DELAYS_MS = [1000, 2000, 4000, 8000, 16000];
 const MAX_RETRIES = 5;
 
 async function sleep(ms: number): Promise<void> {
@@ -62,11 +81,13 @@ async function sleep(ms: number): Promise<void> {
 
 /**
  * withExponentialBackoff — retries an async operation with exponential delays.
- * Retries on any error. Logs each attempt to the console.
  *
- * @param fn         - The async function to retry
- * @param label      - Label for log output
- * @param maxRetries - Maximum number of retries (default 5)
+ * Retryable: network errors, timeouts, HTTP 429 (rate limit), HTTP 5xx.
+ * Non-retryable: invalid API key, safety blocks, invalid argument — these
+ * will never succeed regardless of how many times we retry.
+ *
+ * Throws a classified AppError after all retries are exhausted, based on
+ * the error type of the final failure.
  */
 async function withExponentialBackoff<T>(
   fn: () => Promise<T>,
@@ -79,30 +100,33 @@ async function withExponentialBackoff<T>(
     try {
       if (attempt > 0) {
         const delayMs = BACKOFF_DELAYS_MS[attempt - 1] ?? BACKOFF_DELAYS_MS[BACKOFF_DELAYS_MS.length - 1];
-        console.log(`[${label}] Retry ${attempt}/${maxRetries} — waiting ${delayMs}ms...`);
+        logger.info(`[${label}] Retry ${attempt}/${maxRetries} — waiting ${delayMs}ms...`);
         await sleep(delayMs);
       }
       return await fn();
     } catch (err) {
       lastError = err;
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[${label}] Attempt ${attempt + 1} failed: ${msg}`);
+      logger.warn(`[${label}] Attempt ${attempt + 1} failed: ${msg}`);
 
-      // Don't retry on non-retryable errors
       if (isNonRetryable(err)) {
-        console.error(`[${label}] Non-retryable error — aborting`);
+        logger.warn(`[${label}] Non-retryable error — aborting retries`);
         break;
       }
     }
   }
 
-  throw lastError;
+  // Map the last error to the correct classified AppError
+  throw classifyGeminiError(lastError, label);
 }
 
+/**
+ * isNonRetryable — returns true for errors where retrying would never help.
+ * API key issues, content blocks, and invalid arguments are permanent failures.
+ */
 function isNonRetryable(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   const msg = err.message.toLowerCase();
-  // Bad API key, content blocked by safety filters, invalid argument
   return (
     msg.includes('api_key_invalid') ||
     msg.includes('api key not valid') ||
@@ -110,6 +134,44 @@ function isNonRetryable(err: unknown): boolean {
     msg.includes('blocked') ||
     msg.includes('invalid argument')
   );
+}
+
+/**
+ * classifyGeminiError — maps a raw error from the Gemini SDK into the
+ * appropriate typed AppError so callers get a specific user-facing message.
+ *
+ * Priority order: auth → rate-limit → network/timeout → generic AI error.
+ */
+function classifyGeminiError(err: unknown, label: string): AppError {
+  if (!(err instanceof Error)) return aiUnreachableError();
+  const msg = err.message.toLowerCase();
+
+  if (msg.includes('api_key_invalid') || msg.includes('api key not valid')) {
+    // Log the real cause server-side so ops can act on it, but never expose
+    // the credential nature of the failure to the user.
+    logger.error(`[${label}] AI authentication failure — check GEMINI_API_KEY configuration`, err.message);
+    return aiAuthError();
+  }
+
+  if (msg.includes('429') || msg.includes('quota') || msg.includes('rate limit')) {
+    logger.warn(`[${label}] AI rate limit exhausted after all retries`);
+    return aiRateLimitedError();
+  }
+
+  if (
+    msg.includes('etimedout') ||
+    msg.includes('econnrefused') ||
+    msg.includes('network') ||
+    msg.includes('fetch') ||
+    msg.includes('timeout')
+  ) {
+    logger.warn(`[${label}] AI service unreachable: ${err.message}`);
+    return aiUnreachableError();
+  }
+
+  // Catch-all for other Gemini errors (e.g., safety block after retry abort)
+  logger.warn(`[${label}] Unclassified AI error: ${err.message}`);
+  return aiUnreachableError();
 }
 
 // ─── Prompt builder ───────────────────────────────────────────────────────────
@@ -202,14 +264,19 @@ const FALLBACK_MODEL = 'gemini-2.5-flash';
 
 function getClient(): GoogleGenerativeAI {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new AppError('GEMINI_API_KEY is not configured.', 500);
+  if (!apiKey) {
+    logger.error('[Gemini] GEMINI_API_KEY environment variable is not set');
+    throw aiAuthError();
+  }
   return new GoogleGenerativeAI(apiKey);
 }
 
 async function callGemini(prompt: string): Promise<string> {
   const client = getClient();
 
-  // Try primary model first, fall back on model-not-found errors
+  // Try primary model first; fall back only on model-not-found/unavailable errors.
+  // Other errors (auth, rate-limit, network) are re-thrown immediately so
+  // withExponentialBackoff can inspect them and decide whether to retry.
   for (const modelName of [PRIMARY_MODEL, FALLBACK_MODEL]) {
     try {
       const model = client.getGenerativeModel({
@@ -233,11 +300,10 @@ async function callGemini(prompt: string): Promise<string> {
 
       const result = await model.generateContent(prompt);
       const text = result.response.text();
-      console.log(`[Gemini] Generated response using model: ${modelName} (${text.length} chars)`);
+      logger.info(`[Gemini] Response received via ${modelName} (${text.length} chars)`);
       return text;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      // Only fall through to the next model on model-not-found / model-unavailable
       const isModelError =
         msg.includes('not found') ||
         msg.includes('404') ||
@@ -245,11 +311,12 @@ async function callGemini(prompt: string): Promise<string> {
         msg.includes('unavailable');
 
       if (!isModelError || modelName === FALLBACK_MODEL) throw err;
-      console.warn(`[Gemini] Model ${modelName} failed (${msg}), trying fallback ${FALLBACK_MODEL}...`);
+      logger.warn(`[Gemini] Model ${modelName} unavailable — trying fallback ${FALLBACK_MODEL}`);
     }
   }
 
-  throw new AppError('All Gemini models failed.', 502);
+  // Unreachable: loop above always throws on the fallback model
+  throw aiUnreachableError();
 }
 
 // ─── Main export ──────────────────────────────────────────────────────────────
@@ -257,23 +324,24 @@ async function callGemini(prompt: string): Promise<string> {
 /**
  * generateItinerary — calls Gemini with exponential backoff, validates with Zod,
  * retries once with an amended prompt if validation fails.
+ *
+ * Throws a classified AppError (AI_RATE_LIMITED, AI_UNREACHABLE, AI_AUTH_ERROR,
+ * or AI_INVALID_OUTPUT) — never a raw Error or generic AppError.
  */
 export async function generateItinerary(
   params: PromptParams
 ): Promise<TripGenerationResponse> {
-  // Attempt 1: primary prompt
   const rawText = await withExponentialBackoff(
     () => callGemini(buildPrompt(params, false)),
     'Gemini'
   );
 
-  // Parse JSON
   let parsed: unknown;
   try {
     parsed = JSON.parse(rawText);
   } catch {
-    // JSON parse failed on attempt 1 — try once more with retry prompt
-    console.warn('[Gemini] JSON parse failed on attempt 1 — retrying with amended prompt');
+    // JSON parse failed on attempt 1 — retry with an amended prompt
+    logger.warn('[Gemini] JSON parse failed on first attempt — retrying with amended prompt');
     const retryText = await withExponentialBackoff(
       () => callGemini(buildPrompt(params, true)),
       'Gemini-Retry'
@@ -281,20 +349,16 @@ export async function generateItinerary(
     try {
       parsed = JSON.parse(retryText);
     } catch {
-      throw new AppError(
-        'Failed to generate a valid itinerary. Please try again.',
-        502
-      );
+      logger.error('[Gemini] JSON parse failed on retry — giving up');
+      throw aiInvalidOutputError();
     }
   }
 
-  // Zod validation
   const validation = TripGenerationResponseZ.safeParse(parsed);
   if (!validation.success) {
     const issues = validation.error.issues.map((i) => i.message).join('; ');
-    console.warn(`[Gemini] Zod validation failed: ${issues} — retrying with amended prompt`);
+    logger.warn(`[Gemini] Zod validation failed: ${issues} — retrying with amended prompt`);
 
-    // One retry with validation-failure context in the prompt
     const retryText = await withExponentialBackoff(
       () => callGemini(buildPrompt(params, true)),
       'Gemini-ZodRetry'
@@ -304,22 +368,22 @@ export async function generateItinerary(
     try {
       retryParsed = JSON.parse(retryText);
     } catch {
-      throw new AppError('Failed to generate a valid itinerary. Please try again.', 502);
+      logger.error('[Gemini] JSON parse failed on Zod-retry');
+      throw aiInvalidOutputError();
     }
 
     const retryValidation = TripGenerationResponseZ.safeParse(retryParsed);
     if (!retryValidation.success) {
       const retryIssues = retryValidation.error.issues.map((i) => i.message).join('; ');
-      console.error(`[Gemini] Zod validation failed on retry: ${retryIssues}`);
-      throw new AppError('AI generated an invalid itinerary structure. Please try again.', 502);
+      logger.error(`[Gemini] Zod validation failed on retry: ${retryIssues}`);
+      throw aiInvalidOutputError();
     }
 
-    console.log('[Gemini] Retry validation passed ✓');
+    logger.info('[Gemini] Retry validation passed ✓');
     return retryValidation.data;
   }
 
-
-  console.log(`[Gemini] Validation passed ✓ — ${validation.data.itinerary.length} days generated`);
+  logger.info(`[Gemini] Validation passed ✓ — ${validation.data.itinerary.length} days generated`);
   return validation.data;
 }
 
@@ -369,7 +433,7 @@ function buildRegenerateDayPrompt(params: RegenerateDayParams, isRetry = false):
     ? 'IMPORTANT: Your previous response failed schema validation. Return ONLY the JSON object with an "activities" array.\n\n'
     : '';
 
-  // ── Targeted risk-fix prompt (Section E #3) — used when riskContext is present ──
+  // Targeted risk-fix prompt — used when riskContext is present without userFeedback
   if (riskContext && !userFeedback) {
     return `${retryPrefix}You are a travel risk analyst and itinerary optimizer. A risk flag has been detected on Day ${dayNumber} of a trip to ${destination}:
 
@@ -411,7 +475,7 @@ Respond with ONLY this JSON (no markdown):
 }`;
   }
 
-  // ── General regeneration prompt — used when only userFeedback is present ──
+  // General regeneration prompt — used when userFeedback is present
   return `${retryPrefix}You are an expert travel planner. Regenerate ONLY the activities for Day ${dayNumber} of a trip to ${destination}.
 
 Trip context:
@@ -452,8 +516,8 @@ Respond with ONLY this JSON (no markdown fences, no explanation):
 }
 
 /**
- * regenerateDayActivities — replaces one day's activities via Gemini.
- * Validates with RegenerateDayResponseZ; one Zod-failure retry.
+ * regenerateDayActivities — replaces one day's activities.
+ * Validates with RegenerateDayResponseZ; one Zod-failure retry included.
  */
 export async function regenerateDayActivities(
   params: RegenerateDayParams
@@ -467,19 +531,22 @@ export async function regenerateDayActivities(
   try {
     parsed = JSON.parse(rawText);
   } catch {
-    console.warn('[Gemini-Regen] JSON parse failed — retrying');
+    logger.warn('[Gemini-Regen] JSON parse failed — retrying with amended prompt');
     const retryText = await withExponentialBackoff(
       () => callGemini(buildRegenerateDayPrompt(params, true)),
       'Gemini-Regen-Retry'
     );
     try { parsed = JSON.parse(retryText); }
-    catch { throw new AppError('Failed to regenerate the day. Please try again.', 502); }
+    catch {
+      logger.error('[Gemini-Regen] JSON parse failed on retry');
+      throw aiInvalidOutputError();
+    }
   }
 
   const validation = RegenerateDayResponseZ.safeParse(parsed);
   if (!validation.success) {
     const issues = validation.error.issues.map((i) => i.message).join('; ');
-    console.warn(`[Gemini-Regen] Zod failed: ${issues} — retrying`);
+    logger.warn(`[Gemini-Regen] Zod failed: ${issues} — retrying`);
 
     const retryText = await withExponentialBackoff(
       () => callGemini(buildRegenerateDayPrompt(params, true)),
@@ -487,15 +554,21 @@ export async function regenerateDayActivities(
     );
     let retryParsed: unknown;
     try { retryParsed = JSON.parse(retryText); }
-    catch { throw new AppError('Failed to regenerate the day. Please try again.', 502); }
+    catch {
+      logger.error('[Gemini-Regen] JSON parse failed on Zod-retry');
+      throw aiInvalidOutputError();
+    }
 
     const retryV = RegenerateDayResponseZ.safeParse(retryParsed);
-    if (!retryV.success) throw new AppError('AI generated an invalid day structure. Please try again.', 502);
-    console.log('[Gemini-Regen] Retry validation passed ✓');
+    if (!retryV.success) {
+      logger.error('[Gemini-Regen] Zod validation failed on retry — giving up');
+      throw aiInvalidOutputError();
+    }
+    logger.info('[Gemini-Regen] Retry validation passed ✓');
     return retryV.data.activities;
   }
 
-  console.log(`[Gemini-Regen] Validation passed ✓ — ${validation.data.activities.length} activities`);
+  logger.info(`[Gemini-Regen] Validation passed ✓ — ${validation.data.activities.length} activities`);
   return validation.data.activities;
 }
 
@@ -545,7 +618,7 @@ Respond with ONLY valid JSON (no markdown):
 }
 
 /**
- * generateBudgetEstimate — refreshes the trip budget via Gemini.
+ * generateBudgetEstimate — refreshes the trip budget.
  * Pins the activities cost to the passed activitiesTotalCost; estimates the rest.
  */
 export async function generateBudgetEstimate(
@@ -564,21 +637,24 @@ export async function generateBudgetEstimate(
       'Gemini-Budget-Retry'
     );
     try { parsed = JSON.parse(retry); }
-    catch { throw new AppError('Failed to estimate budget. Please try again.', 502); }
+    catch {
+      logger.error('[Gemini-Budget] JSON parse failed on retry');
+      throw aiInvalidOutputError();
+    }
   }
 
   const v = BudgetRefreshResponseZ.safeParse(parsed);
   if (!v.success) {
     const issues = v.error.issues.map((i) => i.message).join('; ');
-    console.warn(`[Gemini-Budget] Zod failed: ${issues}`);
-    throw new AppError('AI returned an invalid budget structure. Please try again.', 502);
+    logger.warn(`[Gemini-Budget] Zod failed: ${issues}`);
+    throw aiInvalidOutputError();
   }
 
-  // Force-pin activities to the passed value to prevent Gemini from drifting
+  // Force-pin activities to the passed value to prevent model drift
   v.data.activities = params.activitiesTotalCost;
   v.data.total = v.data.transport + v.data.accommodation + v.data.food + v.data.activities;
 
-  console.log(`[Gemini-Budget] Estimate ready — total $${v.data.total}`);
+  logger.info(`[Gemini-Budget] Estimate ready — total $${v.data.total}`);
   return v.data;
 }
 
@@ -627,7 +703,7 @@ Respond with ONLY valid JSON (no markdown):
 }
 
 /**
- * generateHotelSuggestions — returns exactly 3 hotels (one per tier) via Gemini.
+ * generateHotelSuggestions — returns exactly 3 hotels (one per tier).
  * One Zod-failure retry included.
  */
 export async function generateHotelSuggestions(
@@ -646,13 +722,16 @@ export async function generateHotelSuggestions(
       'Gemini-Hotels-Retry'
     );
     try { parsed = JSON.parse(retry); }
-    catch { throw new AppError('Failed to generate hotel suggestions. Please try again.', 502); }
+    catch {
+      logger.error('[Gemini-Hotels] JSON parse failed on retry');
+      throw aiInvalidOutputError();
+    }
   }
 
   const v = HotelsRefreshResponseZ.safeParse(parsed);
   if (!v.success) {
     const issues = v.error.issues.map((i) => i.message).join('; ');
-    console.warn(`[Gemini-Hotels] Zod failed: ${issues} — retrying`);
+    logger.warn(`[Gemini-Hotels] Zod failed: ${issues} — retrying`);
 
     const retry = await withExponentialBackoff(
       () => callGemini(buildHotelsPrompt(params, true)),
@@ -660,14 +739,20 @@ export async function generateHotelSuggestions(
     );
     let retryParsed: unknown;
     try { retryParsed = JSON.parse(retry); }
-    catch { throw new AppError('Failed to generate hotel suggestions. Please try again.', 502); }
+    catch {
+      logger.error('[Gemini-Hotels] JSON parse failed on Zod-retry');
+      throw aiInvalidOutputError();
+    }
 
     const rv = HotelsRefreshResponseZ.safeParse(retryParsed);
-    if (!rv.success) throw new AppError('AI returned invalid hotel data. Please try again.', 502);
-    console.log('[Gemini-Hotels] Retry validation passed ✓');
+    if (!rv.success) {
+      logger.error('[Gemini-Hotels] Zod validation failed on retry — giving up');
+      throw aiInvalidOutputError();
+    }
+    logger.info('[Gemini-Hotels] Retry validation passed ✓');
     return rv.data.hotels;
   }
 
-  console.log(`[Gemini-Hotels] ${v.data.hotels.length} hotels validated ✓`);
+  logger.info(`[Gemini-Hotels] ${v.data.hotels.length} hotels validated ✓`);
   return v.data.hotels;
 }

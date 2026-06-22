@@ -1,7 +1,8 @@
 import { Request, Response } from 'express';
 import mongoose from 'mongoose';
 import { Trip } from '../models/Trip';
-import { AppError, catchAsync } from '../utils/errors';
+import { AppError, catchAsync, databaseError } from '../utils/errors';
+import { logger } from '../utils/logger';
 import { getAuthUser } from '../types/auth.helpers';
 import { geocodeDestination } from '../services/geocoding.service';
 import {
@@ -14,9 +15,9 @@ import { runRiskPass } from '../services/risk.service';
 import type { DayDiff, ActivityShape } from '../types/trip.types';
 
 // ─── Risk-pass helper ─────────────────────────────────────────────────────────
-// applyRiskPass is typed with `any` to sidestep Mongoose's opaque HydratedDocument
-// generic, which causes save() return-type conflicts with any manually defined interface.
-// The eslint suppression is isolated to this one function.
+// Typed with `any` to sidestep Mongoose's opaque HydratedDocument generic,
+// which causes save() return-type conflicts with any manually defined interface.
+// The suppression is isolated to this one helper function.
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function applyRiskPass(trip: any): Promise<void> {
@@ -49,7 +50,9 @@ async function applyRiskPass(trip: any): Promise<void> {
     trip.confidenceScore = result.confidenceScore;
     await trip.save();
   } catch (err) {
-    console.error('[Risk] applyRiskPass failed (non-fatal):', String(err));
+    // Risk pass is non-fatal — the trip is already saved; we log and move on
+    // so a weather API outage doesn't block the user from seeing their itinerary.
+    logger.error('[Risk] applyRiskPass failed (non-fatal):', String(err));
   }
 }
 
@@ -73,12 +76,12 @@ export const createTrip = catchAsync(async (req: Request, res: Response): Promis
 
   const safeInterests = interests.map((i) => String(i).trim()).filter(Boolean).slice(0, 10);
 
-  console.log(`[Trip] Geocoding "${destination}"...`);
+  logger.info(`[Trip] Geocoding "${destination}"...`);
   const geo = await geocodeDestination(destination);
-  if (geo) console.log(`[Trip] Geocoded → (${geo.lat}, ${geo.lng}) ${geo.resolvedName}`);
-  else console.warn(`[Trip] Geocoding failed for "${destination}" — coordinates will be null`);
+  if (geo) logger.info(`[Trip] Geocoded → (${geo.lat}, ${geo.lng}) ${geo.resolvedName}`);
+  else logger.warn(`[Trip] Geocoding failed for "${destination}" — coordinates will be null`);
 
-  console.log(`[Trip] Generating itinerary...`);
+  logger.info(`[Trip] Generating itinerary for "${destination}" (${durationDays}d, ${budgetTier})`);
   const generated = await generateItinerary({
     destination: geo?.resolvedName ?? destination,
     durationDays: Number(durationDays),
@@ -87,29 +90,34 @@ export const createTrip = catchAsync(async (req: Request, res: Response): Promis
     startDate: startDate ?? null,
   });
 
-  const created = await Trip.create({
-    userId: new mongoose.Types.ObjectId(userId),
-    destination: destination.trim(),
-    startDate: startDate ? new Date(startDate) : null,
-    durationDays: Number(durationDays),
-    budgetTier,
-    interests: safeInterests,
-    destinationLat: geo?.lat,
-    destinationLng: geo?.lng,
-    itinerary: generated.itinerary,
-    hotels: generated.hotels,
-    estimatedBudget: generated.estimatedBudget,
-    confidenceScore: 100,
-    riskFlags: [],
-    status: 'ready',
-  });
+  let created;
+  try {
+    created = await Trip.create({
+      userId: new mongoose.Types.ObjectId(userId),
+      destination: destination.trim(),
+      startDate: startDate ? new Date(startDate) : null,
+      durationDays: Number(durationDays),
+      budgetTier,
+      interests: safeInterests,
+      destinationLat: geo?.lat,
+      destinationLng: geo?.lng,
+      itinerary: generated.itinerary,
+      hotels: generated.hotels,
+      estimatedBudget: generated.estimatedBudget,
+      confidenceScore: 100,
+      riskFlags: [],
+      status: 'ready',
+    });
+  } catch (err) {
+    logger.error('[Trip] Database write failed during createTrip:', err);
+    throw databaseError();
+  }
 
-  // Reload for clean HydratedDocument, then run risk pass
   const loaded = await Trip.findById(created._id);
   if (!loaded) throw new AppError('Failed to load created trip.', 500);
   await applyRiskPass(loaded);
 
-  console.log(`[Trip] Created ${loaded._id} — score ${loaded.confidenceScore}`);
+  logger.info(`[Trip] Created ${loaded._id} — score ${loaded.confidenceScore}`);
   res.status(201).json({ trip: loaded });
 });
 
@@ -170,9 +178,14 @@ export const addActivity = catchAsync(async (req: Request, res: Response): Promi
     ...(lng !== undefined && { lng: Number(lng) }),
   });
 
-  await trip.save();
+  try {
+    await trip.save();
+  } catch (err) {
+    logger.error('[Trip] Database write failed during addActivity:', err);
+    throw databaseError();
+  }
   await applyRiskPass(trip);
-  console.log(`[Trip] Added activity to day ${dayNumber} — score now ${trip.confidenceScore}`);
+  logger.info(`[Trip] Added activity to day ${dayNumber} — score now ${trip.confidenceScore}`);
   res.status(201).json({ trip });
 });
 
@@ -193,9 +206,14 @@ export const removeActivity = catchAsync(async (req: Request, res: Response): Pr
   if (idx === -1) throw new AppError('Activity not found.', 404);
 
   day.activities.splice(idx, 1);
-  await trip.save();
+  try {
+    await trip.save();
+  } catch (err) {
+    logger.error('[Trip] Database write failed during removeActivity:', err);
+    throw databaseError();
+  }
   await applyRiskPass(trip);
-  console.log(`[Trip] Removed activity ${activityId} — score now ${trip.confidenceScore}`);
+  logger.info(`[Trip] Removed activity ${activityId} — score now ${trip.confidenceScore}`);
   res.status(200).json({ trip });
 });
 
@@ -238,7 +256,12 @@ export const regenerateDay = catchAsync(async (req: Request, res: Response): Pro
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   day.activities = newActivities as any;
-  await trip.save();
+  try {
+    await trip.save();
+  } catch (err) {
+    logger.error('[Trip] Database write failed during regenerateDay:', err);
+    throw databaseError();
+  }
 
   const reloaded = await Trip.findById(trip._id);
   if (!reloaded) throw new AppError('Trip reload failed after regeneration.', 500);
@@ -252,7 +275,7 @@ export const regenerateDay = catchAsync(async (req: Request, res: Response): Pro
   const diff: DayDiff = { dayNumber, before, after, changedActivityIds };
 
   await applyRiskPass(reloaded);
-  console.log(`[Trip] Regenerated day ${dayNumber} — score now ${reloaded.confidenceScore}`);
+  logger.info(`[Trip] Regenerated day ${dayNumber} — score now ${reloaded.confidenceScore}`);
   res.status(200).json({ trip: reloaded, diff });
 });
 
@@ -272,8 +295,13 @@ export const refreshBudget = catchAsync(async (req: Request, res: Response): Pro
   });
 
   trip.estimatedBudget = estimatedBudget;
-  await trip.save();
-  console.log(`[Trip] Budget refreshed — total $${estimatedBudget.total}`);
+  try {
+    await trip.save();
+  } catch (err) {
+    logger.error('[Trip] Database write failed during refreshBudget:', err);
+    throw databaseError();
+  }
+  logger.info(`[Trip] Budget refreshed — total $${estimatedBudget.total}`);
   res.status(200).json({ estimatedBudget });
 });
 
@@ -289,8 +317,13 @@ export const refreshHotels = catchAsync(async (req: Request, res: Response): Pro
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   trip.hotels = hotels as any;
-  await trip.save();
-  console.log(`[Trip] Hotels refreshed — ${hotels.length} suggestions`);
+  try {
+    await trip.save();
+  } catch (err) {
+    logger.error('[Trip] Database write failed during refreshHotels:', err);
+    throw databaseError();
+  }
+  logger.info(`[Trip] Hotels refreshed — ${hotels.length} suggestions`);
   res.status(200).json({ hotels });
 });
 
@@ -301,6 +334,6 @@ export const refreshRisk = catchAsync(async (req: Request, res: Response): Promi
   if (!trip) throw new AppError('Trip not found.', 404);
 
   await applyRiskPass(trip);
-  console.log(`[Trip] Manual risk refresh — score ${trip.confidenceScore}`);
+  logger.info(`[Trip] Manual risk refresh — score ${trip.confidenceScore}`);
   res.status(200).json({ confidenceScore: trip.confidenceScore, riskFlags: trip.riskFlags });
 });

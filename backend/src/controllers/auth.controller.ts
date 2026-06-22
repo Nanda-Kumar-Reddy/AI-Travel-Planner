@@ -13,9 +13,13 @@ const COOKIE_MAX_AGE = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
 function setAuthCookie(res: Response, token: string): void {
   const isProd = process.env.NODE_ENV === 'production';
   res.cookie(COOKIE_NAME, token, {
-    httpOnly: true,                        // XSS protection — JS cannot read it
-    secure: isProd,                        // HTTPS only in production
-    sameSite: isProd ? 'none' : 'lax',    // 'none' required for cross-origin (Vercel ↔ Render)
+    httpOnly: true,   // XSS protection: JS cannot read this cookie
+    secure: isProd,   // HTTPS-only in production; plain HTTP allowed in dev
+    // 'none' is required when the frontend and API are on different origins
+    // (e.g., Vercel frontend ↔ Render backend). 'none' MUST be paired with
+    // secure:true — browsers reject none+non-secure in modern versions.
+    // In dev both run on localhost so 'lax' is sufficient (and safer).
+    sameSite: isProd ? 'none' : 'lax',
     maxAge: COOKIE_MAX_AGE,
     path: '/',
   });

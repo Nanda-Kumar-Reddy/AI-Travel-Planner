@@ -11,13 +11,15 @@
  * WEATHER_MOCK env var: when "true", returns a canned Day-2 medium flag without any HTTP call.
  */
 
+import { logger } from '../utils/logger';
+
 // ─── Shared types ─────────────────────────────────────────────────────────────
 
 /** Shape the risk pass writes back to the Trip document */
 export interface RiskFlagPayload {
   type: 'pacing' | 'budget' | 'weather';
   severity: 'low' | 'medium' | 'high';
-  dayNumber: number | null;   // mirrors IRiskFlag.dayNumber (null = trip-level)
+  dayNumber: number | null;   // null = trip-level flag (e.g., total budget overrun)
   message: string;
   suggestedFix: string;
 }
@@ -62,7 +64,10 @@ export interface TripInput {
 
 /**
  * Expected ALL-IN daily spend per tier (transport amortised + accommodation + food + activities).
- * Used as the baseline for budget risk thresholds.
+ * These figures are derived from typical travel-industry cost benchmarks:
+ *   Low:    ~$100/day covers a budget hostel, local transport, cheap eats, and a free/cheap activity.
+ *   Medium: ~$300/day covers a mid-range hotel, occasional taxis, sit-down restaurants, and paid attractions.
+ *   High:   ~$700/day covers luxury accommodation, private transfers, fine dining, and premium experiences.
  */
 const EXPECTED_DAILY_TOTAL_USD: Record<string, number> = {
   Low: 100,
@@ -70,8 +75,19 @@ const EXPECTED_DAILY_TOTAL_USD: Record<string, number> = {
   High: 700,
 };
 
-const PACING_MEDIUM_KM = 15; // consecutive activities this far apart → medium flag
-const PACING_HIGH_KM = 35;   // this far → high flag
+/**
+ * Pacing thresholds in kilometres between consecutive same-day activities.
+ *
+ * 15 km — at typical city walking/transit speeds this takes 30–45 min each way,
+ *          which starts to noticeably eat into a half-day activity slot.
+ * 35 km — at this distance, travel time almost certainly exceeds 1 hour each way;
+ *          the day effectively requires a dedicated transit segment to be feasible.
+ *
+ * Values are intentionally coarser than point-to-point routing because we only
+ * have GPS coordinates, not actual road/transit routes.
+ */
+const PACING_MEDIUM_KM = 15;
+const PACING_HIGH_KM   = 35;
 
 // ─── Algorithm 1: Haversine pacing check ─────────────────────────────────────
 
@@ -95,9 +111,10 @@ function checkPacingRisk(itinerary: DayInput[]): RiskFlagPayload[] {
       const a = acts[i];
       const b = acts[i + 1];
 
-      // Either coordinate missing → skip, log, never treat as zero distance
+      // Skip pairs where either coordinate is missing — treat as no data,
+      // never infer zero distance, which would produce false negatives.
       if (a.lat == null || a.lng == null || b.lat == null || b.lng == null) {
-        console.log(
+        logger.debug(
           `[Risk/Pacing] Day ${day.dayNumber}: skipping "${a.title}" → "${b.title}" — missing lat/lng`
         );
         continue;
@@ -140,6 +157,10 @@ function checkBudgetRisk(trip: TripInput): RiskFlagPayload[] {
   const expectedTotal = expectedPerDay * durationDays;
   const ratio = estimatedBudget.total / expectedTotal;
 
+  // >150% of expected spend = high risk: significantly over-budget
+  // >120% of expected spend = medium risk: moderately over-budget
+  // These ratios give reasonable headroom for exchange-rate variation and
+  // premium one-off experiences before triggering a flag.
   if (ratio > 1.5) {
     flags.push({
       type: 'budget',
@@ -158,7 +179,8 @@ function checkBudgetRisk(trip: TripInput): RiskFlagPayload[] {
     });
   }
 
-  // Per-day activity cost spike: flag if any day's activity costs exceed 2× the daily average
+  // Per-day activity cost spike: any single day costing >2× the daily average
+  // suggests an outlier activity that may bust the overall budget.
   if (estimatedBudget.activities > 0) {
     const avgDailyActivities = estimatedBudget.activities / durationDays;
     for (const day of itinerary) {
@@ -214,7 +236,9 @@ async function fetchClimatologyProbs(
   startDate: string,
   endDate: string
 ): Promise<PrecipProb[]> {
-  // Proxy climatology via last year's archive data for the same calendar period
+  // Proxy climatology via last year's archive data for the same calendar period.
+  // This gives a reasonable seasonal baseline when the trip is too far out for
+  // a live 16-day forecast.
   const toDate = (s: string, yearOffset: number) => {
     const d = new Date(s);
     d.setFullYear(d.getFullYear() + yearOffset);
@@ -234,11 +258,13 @@ async function fetchClimatologyProbs(
   if (!res.ok) throw new Error(`Open-Meteo archive HTTP ${res.status}`);
   const data = await res.json() as { daily?: { precipitation_sum?: (number | null)[] } };
 
-  // Convert mm/day → approximate probability buckets
+  // Convert mm/day → approximate probability buckets.
+  // Thresholds are conservative: >10 mm/day is typically classified as "heavy"
+  // rain by meteorological standards; >5 mm is "moderate."
   return (data.daily?.precipitation_sum ?? []).map((mm) => {
     if (mm == null) return 0;
-    if (mm > 10) return 75; // heavy → treat as high probability
-    if (mm > 5) return 50;  // moderate
+    if (mm > 10) return 75; // heavy rain → high probability flag
+    if (mm > 5)  return 50; // moderate rain
     return 20;              // light / dry
   });
 }
@@ -248,16 +274,15 @@ function fmt(d: Date): string {
 }
 
 async function checkWeatherRisk(trip: TripInput): Promise<RiskFlagPayload[]> {
-  // ── WEATHER_MOCK bypass ──────────────────────────────────────────────────────
   if (process.env.WEATHER_MOCK === 'true') {
-    console.log('[Risk/Weather] WEATHER_MOCK=true — returning mock flag, skipping Open-Meteo');
+    logger.info('[Risk/Weather] WEATHER_MOCK=true — returning mock flag, skipping Open-Meteo');
     return [WEATHER_MOCK_FLAG];
   }
 
   const { destinationLat, destinationLng, startDate, durationDays, itinerary } = trip;
 
   if (destinationLat == null || destinationLng == null) {
-    console.log('[Risk/Weather] Skipping — no destination coordinates stored');
+    logger.info('[Risk/Weather] Skipping — no destination coordinates stored');
     return [];
   }
 
@@ -267,7 +292,6 @@ async function checkWeatherRisk(trip: TripInput): Promise<RiskFlagPayload[]> {
     ? Math.ceil((tripStart.getTime() - now.getTime()) / 86_400_000)
     : Infinity;
 
-  // Reference window: trip start (or today) → trip start + durationDays - 1
   const windowStart = tripStart ?? now;
   const windowEnd = new Date(windowStart);
   windowEnd.setDate(windowEnd.getDate() + durationDays - 1);
@@ -277,20 +301,20 @@ async function checkWeatherRisk(trip: TripInput): Promise<RiskFlagPayload[]> {
 
   try {
     if (tripStart && daysUntilTrip <= 16) {
-      console.log(`[Risk/Weather] Using live forecast API — trip starts in ${daysUntilTrip} days`);
+      logger.info(`[Risk/Weather] Using live forecast API — trip starts in ${daysUntilTrip} days`);
       precipProbs = await fetchForecastProbs(
         destinationLat, destinationLng, fmt(windowStart), fmt(windowEnd)
       );
     } else {
       isSeasonalEstimate = true;
       const reason = tripStart ? `${daysUntilTrip} days out` : 'no start date';
-      console.log(`[Risk/Weather] Using climatology (archive) — ${reason}`);
+      logger.info(`[Risk/Weather] Using climatology (archive) — ${reason}`);
       precipProbs = await fetchClimatologyProbs(
         destinationLat, destinationLng, fmt(windowStart), fmt(windowEnd)
       );
     }
   } catch (err) {
-    console.warn(`[Risk/Weather] API call failed (${String(err)}) — skipping weather flags`);
+    logger.warn(`[Risk/Weather] API call failed (${String(err)}) — skipping weather flags`);
     return [];
   }
 
@@ -329,6 +353,9 @@ function computeConfidenceScore(flags: RiskFlagPayload[]): number {
   const high = flags.filter((f) => f.severity === 'high').length;
   const med  = flags.filter((f) => f.severity === 'medium').length;
   const low  = flags.filter((f) => f.severity === 'low').length;
+  // Weights: high=15, medium=8, low=3
+  // A trip with 2 high flags drops to 70 — still usable but clearly needing attention.
+  // A trip with 5 medium flags drops to 60. Score is clamped at 0 so it never goes negative.
   return Math.max(0, Math.min(100, 100 - 15 * high - 8 * med - 3 * low));
 }
 
@@ -340,7 +367,7 @@ function computeConfidenceScore(flags: RiskFlagPayload[]): number {
  * The caller is responsible for persisting the result.
  */
 export async function runRiskPass(trip: TripInput): Promise<RiskPassResult> {
-  console.log(`[Risk] Starting pass for "${trip.destination}" (${trip.durationDays}d, ${trip.budgetTier})`);
+  logger.info(`[Risk] Starting pass for "${trip.destination}" (${trip.durationDays}d, ${trip.budgetTier})`);
 
   const [pacingFlags, budgetFlags, weatherFlags] = await Promise.all([
     Promise.resolve(checkPacingRisk(trip.itinerary)),
@@ -351,7 +378,7 @@ export async function runRiskPass(trip: TripInput): Promise<RiskPassResult> {
   const allFlags = [...pacingFlags, ...budgetFlags, ...weatherFlags];
   const confidenceScore = computeConfidenceScore(allFlags);
 
-  console.log(
+  logger.info(
     `[Risk] Done — score ${confidenceScore} | pacing:${pacingFlags.length} budget:${budgetFlags.length} weather:${weatherFlags.length}`
   );
 

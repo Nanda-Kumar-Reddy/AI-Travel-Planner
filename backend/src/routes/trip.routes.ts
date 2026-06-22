@@ -17,22 +17,20 @@ const router = Router();
 
 router.use(requireAuth);
 
-// ── Phase 3 ──────────────────────────────────────────────────────────────────
+// ── Trip CRUD ─────────────────────────────────────────────────────────────────
 router.post('/', createTrip);
 router.get('/', getTrips);
 router.get('/:id', getTripById);
 router.delete('/:id', deleteTrip);
 
-// ── Phase 4 ──────────────────────────────────────────────────────────────────
+// ── Day operations ────────────────────────────────────────────────────────────
 router.post('/:id/days/:dayNumber/activities', addActivity);
 router.delete('/:id/days/:dayNumber/activities/:activityId', removeActivity);
 router.post('/:id/days/:dayNumber/regenerate', regenerateDay);
 
-// ── Phase 5 ──────────────────────────────────────────────────────────────────
+// ── Trip-level refresh operations ─────────────────────────────────────────────
 router.post('/:id/budget/refresh', refreshBudget);
 router.post('/:id/hotels', refreshHotels);
-
-// ── Phase 6 — Risk engine ────────────────────────────────────────────────────
 router.post('/:id/risk', refreshRisk);
 
 export default router;

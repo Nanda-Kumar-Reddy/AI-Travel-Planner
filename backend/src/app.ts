@@ -2,8 +2,8 @@ import express, { Application, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import { AppError } from './utils/errors';
+import { logger } from './utils/logger';
 
-// Route imports (stubs — will be populated in Phase 2)
 import authRoutes from './routes/auth.routes';
 import tripRoutes from './routes/trip.routes';
 
@@ -14,8 +14,7 @@ app.set('trust proxy', 1);
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 // credentials: true is required for httpOnly cookies to flow cross-origin.
-// FRONTEND_URL can be comma-separated for multiple allowed origins
-// e.g. "http://localhost:3000,https://ai-travel-planner-xi-one.vercel.app"
+// FRONTEND_URL can be comma-separated for multiple allowed origins.
 const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:3000')
   .split(',')
   .map((o) => o.trim())
@@ -54,18 +53,29 @@ app.use((_req: Request, _res: Response, next: NextFunction) => {
   next(new AppError('Route not found', 404));
 });
 
-// ─── Global error handler ────────────────────────────────────────────────────
-// Must have 4 parameters to be recognized by Express as an error handler
+// ─── Global error handler ─────────────────────────────────────────────────────
+// Must have exactly 4 parameters to be recognized by Express as an error handler.
+// Full technical detail (stack, original error) is always logged server-side.
+// Only the pre-approved user-facing message is sent to the client.
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
   if (err instanceof AppError) {
+    // Operational errors: already classified with a user-safe message.
+    // Log full detail at warn/error depending on severity.
+    if (err.statusCode >= 500) {
+      logger.error(`[${err.errorCode}] ${err.message}`, { stack: err.stack, path: req.path });
+    } else {
+      logger.warn(`[${err.errorCode}] ${err.message}`, { path: req.path });
+    }
     res.status(err.statusCode).json({ error: err.message });
     return;
   }
 
-  // Unexpected error — log it, send a generic response (don't leak internals)
-  console.error('Unhandled error:', err);
-  res.status(500).json({ error: 'An unexpected error occurred. Please try again.' });
+  // Truly unexpected error — log with full stack for post-mortem investigation.
+  logger.error('Unhandled error:', { message: err.message, stack: err.stack, path: req.path });
+  res.status(500).json({
+    error: 'Something unexpected happened on our end. Please try again, and contact support if this continues.',
+  });
 });
 
 export default app;

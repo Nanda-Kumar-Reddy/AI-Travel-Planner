@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import { logger } from '../utils/logger';
 
 interface JwtPayload {
   id: string;
@@ -28,8 +29,9 @@ export const requireAuth = (req: Request, res: Response, next: NextFunction): vo
 
   const secret = process.env.JWT_SECRET;
   if (!secret) {
-    // Programming error — JWT_SECRET not set. This should never reach production.
-    console.error('FATAL: JWT_SECRET environment variable is not set');
+    // JWT_SECRET missing: programming error that must never reach production.
+    // Log at error level so ops can catch it immediately in startup logs.
+    logger.error('FATAL: JWT_SECRET environment variable is not set');
     res.status(500).json({ error: 'Server configuration error.' });
     return;
   }
