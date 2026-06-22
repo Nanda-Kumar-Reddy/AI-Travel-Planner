@@ -10,28 +10,28 @@ interface JwtPayload {
 }
 
 /**
- * requireAuth — JWT auth middleware using httpOnly cookie transport.
+ * requireAuth — JWT auth middleware using httpOnly accessToken cookie.
  *
- * Reads req.cookies.token (set by login/register, httpOnly so JS can't read it).
- * Verifies with JWT_SECRET, attaches decoded payload to req.user.
- * Returns 401 on missing token or any verification failure.
+ * Phase 11 change: reads req.cookies.accessToken (was req.cookies.token).
+ * The access token is now short-lived (15 min). When it expires, the frontend
+ * intercepts the 401, silently POSTs to /api/auth/refresh to rotate the
+ * refresh token and get a new access token, then retries the original request.
+ * If the refresh also fails, the user is redirected to /login.
  *
- * Note: We return 401 (not 403) uniformly — the client only needs to know
- * "you need to log in," not the reason for rejection.
+ * Returns 401 uniformly on any failure — the client only needs to know
+ * "you need to log in / refresh," not the specific failure reason.
  */
 export const requireAuth = (req: Request, res: Response, next: NextFunction): void => {
-  const token = req.cookies?.token as string | undefined;
+  const token = req.cookies?.accessToken as string | undefined;
 
   if (!token) {
     res.status(401).json({ error: 'Authentication required. Please log in.' });
     return;
   }
 
-  const secret = process.env.JWT_SECRET;
+  const secret = process.env.JWT_ACCESS_SECRET;
   if (!secret) {
-    // JWT_SECRET missing: programming error that must never reach production.
-    // Log at error level so ops can catch it immediately in startup logs.
-    logger.error('FATAL: JWT_SECRET environment variable is not set');
+    logger.error('FATAL: JWT_ACCESS_SECRET environment variable is not set');
     res.status(500).json({ error: 'Server configuration error.' });
     return;
   }
@@ -40,8 +40,10 @@ export const requireAuth = (req: Request, res: Response, next: NextFunction): vo
     const decoded = jwt.verify(token, secret) as JwtPayload;
     req.user = { id: decoded.id, email: decoded.email };
     next();
-  } catch (err) {
-    // Covers: JsonWebTokenError (invalid signature), TokenExpiredError, NotBeforeError
-    res.status(401).json({ error: 'Session invalid or expired. Please log in again.' });
+  } catch {
+    // TokenExpiredError → frontend will catch 401 and attempt silent refresh
+    // JsonWebTokenError → invalid signature (tampered cookie)
+    // Both treated identically to the client
+    res.status(401).json({ error: 'Session expired. Please log in again.' });
   }
 };
