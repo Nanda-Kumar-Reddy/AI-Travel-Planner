@@ -1,6 +1,8 @@
 # Authentication & Authorization Design
 
 > Full deep-dive for the AI Travel Planner auth system, covering the original design, the Phase 11 access/refresh token expansion, email verification, Google OAuth, and object-level authorization. For a summary, see the [README → Auth & Authorization Approach](../README.md#5-auth--authorization-approach).
+>
+> **Phase 12 note:** Email verification moved from a non-blocking reminder banner (Phase 11) to a hard gate — unverified accounts cannot receive auth tokens at all. See [§3 Non-Blocking vs. Hard-Block Decision](#non-blocking-vs-hard-block-decision) for the updated rationale.
 
 ---
 
@@ -156,16 +158,25 @@ The raw token is never stored — only its SHA-256 hex digest.
 
 ```
 POST /api/auth/register
-  1. Create User with emailVerified: false
-  2. Generate 32-byte random token
-  3. Store SHA-256 hash + 24-hour expiry on User
-  4. Call emailService.sendVerificationEmail() (fire-and-forget)
-     → EMAIL_MODE=mock: logs the full URL to server console
-     → EMAIL_MODE=live: sends via Resend REST API
-  5. Return 201 { message, email } — no cookies issued
+  1. Validate input fields
+  2. Check for existing account:
+     a. emailVerified: true  → 400 "already exists" (hard block)
+     b. emailVerified: false → reuse existing record, regenerate token + resend
+        (prevents duplicate records when a prior send failed)
+     c. No existing user    → create new User with emailVerified: false
+  3. Generate 32-byte random token, store SHA-256 hash + 24-hour expiry
+  4. AWAIT emailService.sendVerificationEmail() — synchronous, not fire-and-forget
+     → EMAIL_MODE=mock: logs the full URL to server console, always succeeds
+     → EMAIL_MODE=live: sends via Gmail SMTP (nodemailer)
+  5a. Email send succeeds  → 201 { message, email } — frontend navigates to /verify-pending
+  5b. Email send fails     → 500 { error, code: 'EMAIL_SEND_FAILED', email }
+       • User record still exists (not lost)
+       • Frontend shows inline error + targeted "Try sending again" action
+         that calls resend-verification (not the full form re-submit)
+       • Real provider error logged server-side; never exposed to client
 ```
 
-**Design choice: registration does not issue tokens.** The user must click the verification link or explicitly log in. They can use the app without verifying (non-blocking), but they are not automatically logged in at registration time.
+**Phase 12 change from Phase 11:** Registration is now atomic with respect to email delivery. The 201 response is only issued if the verification email actually dispatches. This ensures the frontend's "check your inbox" page is shown only when there is actually an email to check.
 
 ### Verification Endpoint
 
@@ -192,18 +203,49 @@ POST /api/auth/resend-verification
   body: { email }
 ```
 
-- Generates a new token, replaces the old hash
-- Always returns the same message regardless of whether the email exists (anti-enumeration)
-- Fire-and-forget email send
+**Phase 12 change from Phase 11:** The email send is now awaited (no longer fire-and-forget):
+- On send success → `200 { message: "Verification email sent. Check your inbox." }`
+- On send failure → `500 { error, code: 'EMAIL_SEND_FAILED' }` — frontend shows retry action
+- Unknown or already-verified email → `200` (anti-enumeration; caller cannot distinguish)
+
+### Login Gate
+
+```
+POST /api/auth/login — email verification check
+```
+
+**Phase 12 change from Phase 11:** The hard gate is now unconditional (previously opt-in via `EMAIL_VERIFY_REQUIRED=true`). After password verification succeeds:
+
+- `emailVerified: true`  → issue token pair → `200`
+- `emailVerified: false` → `403` with `{ error: "...", code: "EMAIL_NOT_VERIFIED" }` — NO tokens issued
+
+**Why 403 (not 401) for unverified accounts:**
+- `401` means the identity could not be confirmed — wrong credentials
+- `403` means the identity IS confirmed but access is forbidden — correct credentials, just not yet verified
+- Using a distinct status code and `code` field lets the frontend branch to a targeted "Resend verification" UX on the login form itself, rather than showing the confusing generic "invalid credentials" message
+
+**Anti-enumeration strategy (preserved from Phase 11):**
+- No user found OR wrong password → `401` with the SAME generic message (`"Invalid email or password."`)
+- Correct password AND email IS verified → `200` with tokens
+- Correct password BUT email NOT verified → `403` with `EMAIL_NOT_VERIFIED`
+  (safe to distinguish: the user already knows their email is registered here)
 
 ### Non-Blocking vs. Hard-Block Decision
 
-**Decision: non-blocking (default).** Users can log in with an unverified email and see a dismissible reminder banner in the dashboard. Hard block is opt-in via `EMAIL_VERIFY_REQUIRED=true`.
+> **⚠️ Phase 12 supersedes the Phase 11 decision. The hard gate is now unconditional.**
 
-**Why non-blocking:**  
-A hard block on unverified email can permanently lock users out if transactional email delivery fails during signup. This is a common failure mode at launch — new domains, spam filters, or provider outages all cause silent email delivery failures. A user who can't receive the verification email and can't log in has no path forward except contacting support. The soft reminder makes this failure mode recoverable: they can use the app, see the banner, and resend the link once email delivery is working.
+**Phase 11 decision (non-blocking):** Users could log in with an unverified email and see a dismissible reminder banner. Hard block was opt-in via `EMAIL_VERIFY_REQUIRED=true`.
 
-**When to enable hard block:** Once you have reliable email delivery, a monitored bounce/complaint rate, and a user base that has had time to verify.
+**Phase 12 decision (hard gate):** Unverified accounts cannot receive auth tokens under any circumstances. `EMAIL_VERIFY_REQUIRED=true` env var is removed — the gate is always on.
+
+**Why this reversal:**
+A launching product needs to guarantee email ownership before granting access. Email verification is the only proof that the person who created the account controls the inbox. Without it:
+- Password reset emails go to unverified addresses the attacker may not control
+- The resend-verification flow (added in Phase 11) provides a recovery path for delivery failures — users are never permanently locked out
+- If the email delivery fails, the frontend shows a specific `EMAIL_SEND_FAILED` error with a targeted retry action, not a dead end
+
+**Why the resend flow makes hard-gating safe:**
+The Phase 11 concern was "what if transient email delivery fails and locks the user out?" The resend endpoint + `EMAIL_SEND_FAILED` response code solve this: the user gets an actionable error, not a silent failure, and can retry immediately without re-submitting the registration form.
 
 ---
 
@@ -299,7 +341,7 @@ The LifeLine Australia project (`~/Desktop/LifeLine Australia`) was reviewed bef
 | Refresh token as JWT | ✅ JWT (verifiable) | ❌ Changed → opaque random hex | Opaque token has no value without DB row; true server-side revocation |
 | Passport.js redirect flow | ✅ Used | ❌ Replaced → GIS + `google-auth-library` | API-only backend; redirect flow requires cross-origin session handling |
 | CSRF cookie | ✅ Third cookie (JS-readable) | ❌ Not implemented | SameSite=None provides CSRF protection for cross-origin; see §7 |
-| Hard-block on unverified email | ✅ (403 on login) | ❌ Changed → non-blocking banner | Safer at launch; avoids permanent lockout from email delivery failures |
+| Hard-block on unverified email | ✅ (403 on login) | ✅ Phase 12: hard gate, unconditional (Phase 11 non-blocking banner is superseded) | Launching product must guarantee email ownership; resend flow provides recovery path |
 | Passport sessions | ✅ Server-side session store | ❌ Replaced → stateless tokens | Stateless is simpler for API-only backend |
 | `EMAIL_MODE` mock guard | Similar concept | ✅ Adapted | Same pattern as existing `WEATHER_MOCK`; same dev-safety rationale |
 
