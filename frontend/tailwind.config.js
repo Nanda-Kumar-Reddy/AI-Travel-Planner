@@ -5,31 +5,34 @@ module.exports = {
     './src/components/**/*.{js,ts,jsx,tsx,mdx}',
     './src/app/**/*.{js,ts,jsx,tsx,mdx}',
   ],
+  // next-themes adds data-theme attribute to <html>
+  darkMode: ['class', '[data-theme="dark"]'],
   theme: {
     extend: {
-      // ── Editorial Indigo design system ──────────────────────────────────────
+      // ── Editorial Indigo design system — all resolved via CSS vars ─────────
       colors: {
-        void: '#09090F',
+        // These map to CSS vars so they respond to data-theme attribute changes
+        void: 'var(--color-void)',
         surface: {
-          DEFAULT: '#12121C',
-          2: '#1C1C2E',
-          3: '#252538',
+          DEFAULT: 'var(--color-surface)',
+          2: 'var(--color-surface-2)',
+          3: 'var(--color-surface-3)',
         },
-        border: '#2A2A3F',
+        border: 'var(--color-border)',
         accent: {
-          DEFAULT: '#6366F1',
-          hover: '#818CF8',
-          warm: '#F59E0B',
+          DEFAULT: 'var(--color-accent)',
+          hover: 'var(--color-accent-hover)',
+          warm: 'var(--color-accent-warm)',
         },
         risk: {
-          high: '#EF4444',
-          medium: '#F59E0B',
-          low: '#22C55E',
+          high: 'var(--color-risk-high)',
+          medium: 'var(--color-risk-medium)',
+          low: 'var(--color-risk-low)',
         },
         text: {
-          primary: '#F8F8FF',
-          secondary: '#A0A0B8',
-          muted: '#6B6B88',
+          primary: 'var(--color-text-primary)',
+          secondary: 'var(--color-text-secondary)',
+          muted: 'var(--color-text-muted)',
         },
       },
       fontFamily: {
@@ -39,50 +42,49 @@ module.exports = {
       backgroundImage: {
         'gradient-radial': 'radial-gradient(var(--tw-gradient-stops))',
         'gradient-conic': 'conic-gradient(from 180deg at 50% 50%, var(--tw-gradient-stops))',
-        'surface-gradient': 'linear-gradient(135deg, #12121C 0%, #1C1C2E 100%)',
       },
       boxShadow: {
         'accent-glow': '0 0 20px rgba(99, 102, 241, 0.3)',
-        'warm-glow': '0 0 20px rgba(245, 158, 11, 0.3)',
-        'card-hover': '0 8px 32px rgba(0, 0, 0, 0.4)',
-        'card': '0 2px 8px rgba(0, 0, 0, 0.3)',
+        'warm-glow':   '0 0 20px rgba(245, 158, 11, 0.3)',
+        'card-hover':  '0 8px 32px rgba(0, 0, 0, 0.4)',
+        'card':        '0 2px 8px rgba(0, 0, 0, 0.3)',
       },
       animation: {
-        'fade-in': 'fadeIn 0.5s ease-out',
-        'slide-up': 'slideUp 0.4s ease-out',
-        'slide-down': 'slideDown 0.3s ease-out',
-        'scale-in': 'scaleIn 0.3s ease-out',
-        'pulse-ring': 'pulseRing 2s ease-in-out infinite',
-        'draw-path': 'drawPath 2s ease-in-out forwards',
-        'count-up': 'countUp 0.8s ease-out forwards',
+        'fade-in':   'fadeIn 0.5s cubic-bezier(0.4, 0, 0.2, 1) both',
+        'slide-up':  'slideUp 0.45s cubic-bezier(0.34, 1.2, 0.64, 1) both',
+        'slide-down':'slideDown 0.3s cubic-bezier(0.4, 0, 0.2, 1) both',
+        'scale-in':  'scaleIn 0.3s cubic-bezier(0.34, 1.2, 0.64, 1) both',
+        'pulse-ring':'pulseRing 2s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+        'draw-path': 'drawPath 2.5s cubic-bezier(0.4, 0, 0.2, 1) forwards',
+        'count-up':  'countUp 0.8s cubic-bezier(0.4, 0, 0.2, 1) forwards',
       },
       keyframes: {
         fadeIn: {
-          '0%': { opacity: '0' },
+          '0%':   { opacity: '0' },
           '100%': { opacity: '1' },
         },
         slideUp: {
-          '0%': { opacity: '0', transform: 'translateY(16px)' },
+          '0%':   { opacity: '0', transform: 'translateY(16px)' },
           '100%': { opacity: '1', transform: 'translateY(0)' },
         },
         slideDown: {
-          '0%': { opacity: '0', transform: 'translateY(-8px)' },
+          '0%':   { opacity: '0', transform: 'translateY(-8px)' },
           '100%': { opacity: '1', transform: 'translateY(0)' },
         },
         scaleIn: {
-          '0%': { opacity: '0', transform: 'scale(0.95)' },
+          '0%':   { opacity: '0', transform: 'scale(0.95)' },
           '100%': { opacity: '1', transform: 'scale(1)' },
         },
         pulseRing: {
           '0%, 100%': { boxShadow: '0 0 0 0 rgba(99, 102, 241, 0.4)' },
-          '50%': { boxShadow: '0 0 0 8px rgba(99, 102, 241, 0)' },
+          '50%':       { boxShadow: '0 0 0 8px rgba(99, 102, 241, 0)' },
         },
         drawPath: {
-          '0%': { strokeDashoffset: '1000' },
+          '0%':   { strokeDashoffset: '1000' },
           '100%': { strokeDashoffset: '0' },
         },
         countUp: {
-          '0%': { opacity: '0', transform: 'translateY(4px)' },
+          '0%':   { opacity: '0', transform: 'translateY(4px)' },
           '100%': { opacity: '1', transform: 'translateY(0)' },
         },
       },

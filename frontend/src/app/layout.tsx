@@ -1,7 +1,9 @@
 import type { Metadata } from 'next';
 import { Outfit, Inter } from 'next/font/google';
+import Script from 'next/script';
 import './globals.css';
 import { AuthProvider } from '../components/auth/AuthProvider';
+import { ThemeProvider } from '../components/theme/ThemeProvider';
 
 const outfit = Outfit({
   subsets: ['latin'],
@@ -27,18 +29,43 @@ export const metadata: Metadata = {
   },
 };
 
+// Anti-flash script: runs synchronously before paint to apply stored theme
+// Must be inlined (beforeInteractive) to block paint until theme is applied
+const antiFlashScript = `
+(function() {
+  try {
+    var stored = localStorage.getItem('atp-theme');
+    var theme = stored === 'light' ? 'light'
+              : stored === 'dark'  ? 'dark'
+              : window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', theme);
+    document.documentElement.style.colorScheme = theme;
+  } catch(e) {}
+})();
+`;
+
 export default function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className={`${outfit.variable} ${inter.variable}`}>
-      <body className="bg-void text-text-primary font-body antialiased">
-        {/* AuthProvider runs init() on mount to restore session from httpOnly cookie */}
-        <AuthProvider>
-          {children}
-        </AuthProvider>
+    <html lang="en" className={`${outfit.variable} ${inter.variable}`} suppressHydrationWarning>
+      <head>
+        {/* Synchronous anti-flash script — must run before any CSS paint */}
+        <Script
+          id="theme-init"
+          strategy="beforeInteractive"
+          dangerouslySetInnerHTML={{ __html: antiFlashScript }}
+        />
+      </head>
+      <body className="antialiased" style={{ fontFamily: 'var(--font-body)' }}>
+        <ThemeProvider>
+          {/* AuthProvider runs init() on mount to restore session from httpOnly cookie */}
+          <AuthProvider>
+            {children}
+          </AuthProvider>
+        </ThemeProvider>
       </body>
     </html>
   );
