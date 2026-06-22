@@ -1,30 +1,25 @@
 /**
- * email.service.ts — centralized email sending via Gmail SMTP (nodemailer).
+ * email.service.ts — centralized email sending via Resend HTTP API.
  *
  * ALL outgoing emails from this platform must flow through this service.
- * Do NOT create separate transporters or email logic outside this file.
+ * Do NOT create separate email logic outside this file.
  *
- * Adapted from the LifeLine Australia emailService.ts pattern:
- *   - Singleton transporter (create once, reuse)
- *   - Shared emailWrapper() layout (dark theme to match this app's brand)
- *   - Class-based public API, exported as a single instance
+ * Why Resend instead of SMTP/Nodemailer:
+ *   Render's free tier blocks outbound SMTP ports (25, 465, 587).
+ *   Resend sends over HTTPS (port 443) — not subject to that restriction.
+ *   Same EMAIL_MODE=mock / live guard as before; calling code unchanged.
  *
- * Production SMTP configuration (matching LifeLine Australia reference):
- *   service: 'gmail' — nodemailer resolves host/port/TLS automatically for Gmail.
- *   auth: { user, pass } — Gmail address + Gmail App Password (NOT account password).
- *
- * Gmail App Password setup (required for SMTP_PASS):
- *   Google Account → Security → 2-Step Verification → App Passwords
- *   Generate one for "Mail / Other (AI Travel Planner)"
- *   Use that 16-char password as SMTP_PASS (NOT your Google account password)
+ * Required env vars (when EMAIL_MODE=live):
+ *   RESEND_KEY         — API key from resend.com dashboard
+ *   EMAIL_FROM_ADDRESS — Sender address (must be verified in Resend dashboard,
+ *                        or use onboarding@resend.dev for testing any inbox)
  *
  * EMAIL_MODE guard:
  *   mock — logs verification link to server console; safe for local dev/demo
- *   live — sends via Gmail SMTP (requires SMTP_USER + SMTP_PASS)
- *   Default when unset: mock (startup validation in server.ts enforces SMTP
- *   credentials are present before the server starts when mode is 'live')
+ *   live — sends via Resend API
+ *   Default when unset: mock (safe fallback)
  */
-import nodemailer from 'nodemailer';
+import { Resend } from 'resend';
 import { logger } from '../utils/logger';
 
 // ── Config helpers ─────────────────────────────────────────────────────────────
@@ -34,47 +29,39 @@ function getEmailMode(): 'mock' | 'live' {
 }
 
 function getFrontendUrl(): string {
-  // FRONTEND_URL can be comma-separated (multiple origins) — take the first
   return (process.env.FRONTEND_URL || 'http://localhost:3000').split(',')[0].trim();
 }
 
 const APP_NAME = 'AI Travel Planner';
 
-// ── Singleton transporter ──────────────────────────────────────────────────────
+// ── Resend singleton ──────────────────────────────────────────────────────────
 //
-// Matches the LifeLine Australia production pattern:
-//   nodemailer.createTransport({ service: 'gmail', auth: { user, pass } })
-//
-// The transporter is created eagerly at module load time when EMAIL_MODE=live,
-// so any credential misconfiguration surfaces immediately on startup rather
-// than on the first email send attempt.
-//
-// Lazily created when EMAIL_MODE=mock so the server starts fine without
-// SMTP credentials configured (local dev / demo mode).
+// Lazily created so the server starts fine in mock mode without a RESEND_KEY.
+// In live mode, server.ts validateEnv() guarantees RESEND_KEY is present before
+// this code is ever called.
 
-let _transporter: nodemailer.Transporter | null = null;
+let _resend: Resend | null = null;
 
-function getTransporter(): nodemailer.Transporter {
-  if (!_transporter) {
-    const user = process.env.SMTP_USER;
-    const pass = process.env.SMTP_PASS;
-
-    if (!user || !pass) {
-      throw new Error(
-        'SMTP_USER and SMTP_PASS must be set when EMAIL_MODE=live.\n' +
-        'Generate a Gmail App Password at: ' +
-        'Google Account → Security → 2-Step Verification → App Passwords'
-      );
+function getResend(): Resend {
+  if (!_resend) {
+    const apiKey = process.env.RESEND_KEY;
+    if (!apiKey) {
+      throw new Error('RESEND_KEY must be set when EMAIL_MODE=live.');
     }
-
-    // Matches LifeLine Australia production SMTP configuration exactly.
-    // service:'gmail' lets nodemailer handle host/port/TLS resolution for Gmail.
-    _transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: { user, pass },
-    });
+    _resend = new Resend(apiKey);
   }
-  return _transporter;
+  return _resend;
+}
+
+// ── From address ──────────────────────────────────────────────────────────────
+//
+// EMAIL_FROM_ADDRESS defaults to onboarding@resend.dev (Resend's shared testing
+// domain — delivers to any inbox immediately, no DNS setup needed).
+// Set EMAIL_FROM_ADDRESS to your own verified domain address for branded sends.
+
+function getFromAddress(): string {
+  const addr = process.env.EMAIL_FROM_ADDRESS || 'onboarding@resend.dev';
+  return `"${APP_NAME}" <${addr}>`;
 }
 
 // ── Shared email layout (dark theme) ──────────────────────────────────────────
@@ -125,16 +112,19 @@ function emailWrapper(body: string): string {
 }
 
 // ── Primary send helper ────────────────────────────────────────────────────────
-//
-// Matches LifeLine Australia sendMail() pattern: transporter.sendMail() with
-// from/to/subject/html fields. The from address uses SMTP_USER (the Gmail
-// address configured for sending) with the APP_NAME display name.
 
 async function sendMail(to: string, subject: string, html: string): Promise<void> {
-  const transporter = getTransporter();
-  const from = `"${APP_NAME}" <${process.env.SMTP_USER}>`;
+  const resend = getResend();
+  const { error } = await resend.emails.send({
+    from: getFromAddress(),
+    to,
+    subject,
+    html,
+  });
 
-  await transporter.sendMail({ from, to, subject, html });
+  if (error) {
+    throw new Error(`Resend API error: ${error.message}`);
+  }
 }
 
 // ── Email Service ──────────────────────────────────────────────────────────────
@@ -144,7 +134,7 @@ class EmailService {
    * sendVerificationEmail — sends the email verification link.
    *
    * In mock mode: logs the full verification URL to the server console.
-   * In live mode: sends via Gmail SMTP (nodemailer) — matches LifeLine pattern.
+   * In live mode: sends via Resend HTTP API.
    */
   async sendVerificationEmail(to: string, rawToken: string): Promise<void> {
     const verifyUrl = `${getFrontendUrl()}/verify-email?token=${rawToken}`;
