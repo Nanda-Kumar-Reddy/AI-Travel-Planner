@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { Eye, EyeOff, UserPlus, Plane, Check, Mail } from 'lucide-react';
+import { Eye, EyeOff, UserPlus, Plane, Check, AlertCircle, RefreshCw } from 'lucide-react';
 import { useAuthStore, ApiError } from '../../store/auth.store';
 import { cn } from '../../lib/utils';
 
@@ -78,6 +78,64 @@ function GoogleSignUpButton({ onSuccess, onError }: {
   );
 }
 
+// ── Resend action shown after EMAIL_SEND_FAILED ────────────────────────────────
+// The user's account already exists — they don't need to re-submit the form.
+// This component calls resend-verification directly for a targeted retry.
+
+interface ResendAfterFailureProps {
+  email: string;
+  onSuccess: () => void;
+}
+
+function ResendAfterFailure({ email, onSuccess }: ResendAfterFailureProps) {
+  type ResendState = 'idle' | 'loading' | 'error';
+  const { resendVerification } = useAuthStore();
+  const [state, setState] = useState<ResendState>('idle');
+  const [resendError, setResendError] = useState('');
+
+  const handleResend = async () => {
+    setState('loading');
+    setResendError('');
+    try {
+      await resendVerification(email);
+      onSuccess(); // parent navigates to /verify-pending
+    } catch (err) {
+      setState('error');
+      if (err instanceof ApiError) {
+        setResendError(err.message);
+      } else {
+        setResendError("We couldn't reach the server. Please check your connection and try again.");
+      }
+    }
+  };
+
+  return (
+    <div className="space-y-2">
+      {state === 'error' && (
+        <p className="text-xs text-risk-high text-center">{resendError}</p>
+      )}
+      <button
+        onClick={handleResend}
+        disabled={state === 'loading'}
+        className="btn-secondary w-full justify-center"
+        id="register-resend-after-failure"
+      >
+        {state === 'loading' ? (
+          <>
+            <span className="w-4 h-4 border-2 border-accent/30 border-t-accent rounded-full animate-spin" />
+            Sending…
+          </>
+        ) : (
+          <>
+            <RefreshCw className="w-4 h-4" />
+            {state === 'error' ? 'Try sending again' : 'Try sending verification email again'}
+          </>
+        )}
+      </button>
+    </div>
+  );
+}
+
 // ── Register Page ─────────────────────────────────────────────────────────────
 
 export default function RegisterPage() {
@@ -88,12 +146,16 @@ export default function RegisterPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+
+  // error: generic message OR field-level message
   const [error, setError] = useState('');
+  // emailSendFailed: distinct state for EMAIL_SEND_FAILED — account exists,
+  // need targeted resend action rather than re-submitting the whole form.
+  const [emailSendFailed, setEmailSendFailed] = useState(false);
+  const [failedEmail, setFailedEmail] = useState('');
+
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isGoogleLoading, setIsGoogleLoading] = useState(false);
-
-  // Post-registration success state — show "check your email" instead of redirecting
-  const [registeredEmail, setRegisteredEmail] = useState<string | null>(null);
 
   // Already logged in → redirect
   useEffect(() => {
@@ -103,21 +165,38 @@ export default function RegisterPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setEmailSendFailed(false);
 
     if (password.length < 8) {
       setError('Password must be at least 8 characters.');
       return;
     }
 
+    // Enter loading state immediately — persists for the full request duration
+    // including the time the backend spends sending the email (now synchronous).
     setIsSubmitting(true);
     try {
-      // Phase 11: register() no longer auto-logs-in.
-      // It returns { message, email } and we show the "check email" success state.
       const result = await register({ name, email, password });
-      setRegisteredEmail(result.email);
+      // Phase 12: 201 — email was sent. Navigate to /verify-pending.
+      router.push(`/verify-pending?email=${encodeURIComponent(result.email)}`);
     } catch (err) {
       if (err instanceof ApiError) {
-        setError(err.message);
+        if (err.code === 'EMAIL_SEND_FAILED') {
+          // Account was created but email dispatch failed.
+          // Stay on form, surface targeted resend action — do NOT make the user
+          // re-fill their details; the account already exists.
+          // err.data?.email has the canonical email the backend stored (normalized).
+          const sentEmail = (typeof err.data?.email === 'string' ? err.data.email : null) ?? email;
+          setEmailSendFailed(true);
+          setFailedEmail(sentEmail);
+          setError(err.message);
+        } else {
+          // 400 validation, 400 duplicate-verified-email, etc.
+          setError(err.message);
+        }
+      } else if (err instanceof TypeError) {
+        // Network failure — request never reached the server
+        setError("We couldn't reach the server. Please check your connection and try again.");
       } else {
         setError('Something went wrong. Please try again.');
       }
@@ -128,11 +207,9 @@ export default function RegisterPage() {
 
   const handleGoogleSuccess = async (idToken: string) => {
     setError('');
+    setEmailSendFailed(false);
     setIsGoogleLoading(true);
     try {
-      // Google sign-up goes through the same /api/auth/google endpoint.
-      // If it's a new user, case 3 creates the account with emailVerified:true.
-      // If it's an existing user, they get logged in directly.
       await loginWithGoogle(idToken);
       router.replace('/dashboard');
     } catch (err) {
@@ -148,72 +225,13 @@ export default function RegisterPage() {
 
   const handleGoogleError = (msg: string) => setError(msg);
 
+  // Called by ResendAfterFailure on successful resend → navigate to /verify-pending
+  const handleResendSuccess = () => {
+    router.push(`/verify-pending?email=${encodeURIComponent(failedEmail)}`);
+  };
+
   const isFormValid = name.trim().length >= 2 && email.includes('@') && password.length >= 8;
   const anyLoading = isLoading || isSubmitting || isGoogleLoading;
-
-  // ── Success state: show "check your email" ────────────────────────────────
-  if (registeredEmail) {
-    return (
-      <main className="min-h-screen bg-void flex items-center justify-center px-4 py-12">
-        <div className="fixed inset-0 overflow-hidden pointer-events-none" aria-hidden="true">
-          <div className="absolute -top-40 -right-40 w-96 h-96 bg-accent/10 rounded-full blur-3xl" />
-          <div className="absolute -bottom-40 -left-40 w-80 h-80 bg-accent-warm/8 rounded-full blur-3xl" />
-        </div>
-
-        <div className="w-full max-w-md relative">
-          <div className="flex items-center justify-center gap-2 mb-8">
-            <div className="w-10 h-10 rounded-xl bg-accent/20 border border-accent/30 flex items-center justify-center">
-              <Plane className="w-5 h-5 text-accent" strokeWidth={1.5} />
-            </div>
-            <span className="font-display text-xl font-semibold text-text-primary">
-              AI Travel Planner
-            </span>
-          </div>
-
-          <div className="card p-8 space-y-6 text-center">
-            <div className="flex justify-center">
-              <div className="w-16 h-16 rounded-full bg-accent/15 border border-accent/30 flex items-center justify-center">
-                <Mail className="w-8 h-8 text-accent" />
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <h1 className="font-display text-2xl font-bold text-text-primary">
-                Check your email
-              </h1>
-              <p className="text-text-secondary text-sm">
-                We&apos;ve sent a verification link to{' '}
-                <span className="text-text-primary font-medium">{registeredEmail}</span>.
-                Click the link to activate your account.
-              </p>
-              {/* <p className="text-text-muted text-xs mt-2">
-                In development / demo mode, the link is logged to the server console
-                (EMAIL_MODE=mock).
-              </p> */}
-            </div>
-
-            <Link
-              href="/login"
-              className="btn-primary w-full justify-center inline-flex"
-              id="register-success-go-to-login"
-            >
-              Go to sign in
-            </Link>
-
-            <p className="text-text-muted text-xs">
-              Didn&apos;t get an email?{' '}
-              <button
-                onClick={() => setRegisteredEmail(null)}
-                className="text-accent hover:text-accent/80 underline underline-offset-2"
-              >
-                Try a different email
-              </button>
-            </p>
-          </div>
-        </div>
-      </main>
-    );
-  }
 
   // ── Registration form ─────────────────────────────────────────────────────
   return (
@@ -242,125 +260,137 @@ export default function RegisterPage() {
             <p className="text-text-secondary text-sm">Start planning your next adventure</p>
           </div>
 
-          {/* Error message */}
+          {/* Error / EMAIL_SEND_FAILED message */}
           {error && (
             <div
               role="alert"
               className="flex items-start gap-3 px-4 py-3 rounded-lg bg-risk-high/10 border border-risk-high/25 text-risk-high text-sm"
             >
-              <span className="mt-0.5 shrink-0">⚠</span>
+              <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
               <span>{error}</span>
             </div>
           )}
 
-          {/* Google Sign-Up */}
-          <div className="space-y-3">
-            <GoogleSignUpButton onSuccess={handleGoogleSuccess} onError={handleGoogleError} />
-            {isGoogleLoading && (
-              <div className="flex items-center justify-center gap-2 text-sm text-text-muted">
-                <span className="w-4 h-4 border-2 border-accent/30 border-t-accent rounded-full animate-spin" />
-                Continuing with Google…
+          {/* Targeted resend action — only shown after EMAIL_SEND_FAILED */}
+          {emailSendFailed && (
+            <ResendAfterFailure email={failedEmail} onSuccess={handleResendSuccess} />
+          )}
+
+          {/* Google Sign-Up — hidden once we're in EMAIL_SEND_FAILED state */}
+          {!emailSendFailed && (
+            <div className="space-y-3">
+              <GoogleSignUpButton onSuccess={handleGoogleSuccess} onError={handleGoogleError} />
+              {isGoogleLoading && (
+                <div className="flex items-center justify-center gap-2 text-sm text-text-muted">
+                  <span className="w-4 h-4 border-2 border-accent/30 border-t-accent rounded-full animate-spin" />
+                  Continuing with Google…
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Divider — only when showing the email form */}
+          {!emailSendFailed && (
+            <div className="relative">
+              <div className="absolute inset-0 flex items-center">
+                <div className="w-full border-t border-border" />
               </div>
-            )}
-          </div>
-
-          {/* Divider */}
-          <div className="relative">
-            <div className="absolute inset-0 flex items-center">
-              <div className="w-full border-t border-border" />
+              <div className="relative flex justify-center text-xs text-text-muted">
+                <span className="bg-surface px-2">or create account with email</span>
+              </div>
             </div>
-            <div className="relative flex justify-center text-xs text-text-muted">
-              <span className="bg-surface px-2">or create account with email</span>
-            </div>
-          </div>
+          )}
 
-          <form onSubmit={handleSubmit} className="space-y-4" noValidate>
-            {/* Name */}
-            <div className="space-y-1.5">
-              <label htmlFor="name" className="block text-sm font-medium text-text-secondary">
-                Full name
-              </label>
-              <input
-                id="name"
-                type="text"
-                autoComplete="name"
-                required
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                className="input"
-                placeholder="Alex Johnson"
-                disabled={anyLoading}
-                minLength={2}
-              />
-            </div>
-
-            {/* Email */}
-            <div className="space-y-1.5">
-              <label htmlFor="email" className="block text-sm font-medium text-text-secondary">
-                Email address
-              </label>
-              <input
-                id="email"
-                type="email"
-                autoComplete="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                className="input"
-                placeholder="you@example.com"
-                disabled={anyLoading}
-              />
-            </div>
-
-            {/* Password */}
-            <div className="space-y-1.5">
-              <label htmlFor="password" className="block text-sm font-medium text-text-secondary">
-                Password
-              </label>
-              <div className="relative">
+          {/* Registration form — hidden after EMAIL_SEND_FAILED (account exists) */}
+          {!emailSendFailed && (
+            <form onSubmit={handleSubmit} className="space-y-4" noValidate>
+              {/* Name */}
+              <div className="space-y-1.5">
+                <label htmlFor="name" className="block text-sm font-medium text-text-secondary">
+                  Full name
+                </label>
                 <input
-                  id="password"
-                  type={showPassword ? 'text' : 'password'}
-                  autoComplete="new-password"
+                  id="name"
+                  type="text"
+                  autoComplete="name"
                   required
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className={cn('input pr-11')}
-                  placeholder="Min. 8 characters"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  className="input"
+                  placeholder="Alex Johnson"
+                  disabled={anyLoading}
+                  minLength={2}
+                />
+              </div>
+
+              {/* Email */}
+              <div className="space-y-1.5">
+                <label htmlFor="email" className="block text-sm font-medium text-text-secondary">
+                  Email address
+                </label>
+                <input
+                  id="email"
+                  type="email"
+                  autoComplete="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  className="input"
+                  placeholder="you@example.com"
                   disabled={anyLoading}
                 />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword((v) => !v)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-secondary transition-colors"
-                  aria-label={showPassword ? 'Hide password' : 'Show password'}
-                >
-                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                </button>
               </div>
-              <PasswordStrength password={password} />
-            </div>
 
-            {/* Submit */}
-            <button
-              type="submit"
-              disabled={anyLoading || !isFormValid}
-              className="btn-primary w-full justify-center"
-              id="register-submit"
-            >
-              {isSubmitting ? (
-                <>
-                  <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  Creating account…
-                </>
-              ) : (
-                <>
-                  <UserPlus className="w-4 h-4" />
-                  Create account
-                </>
-              )}
-            </button>
-          </form>
+              {/* Password */}
+              <div className="space-y-1.5">
+                <label htmlFor="password" className="block text-sm font-medium text-text-secondary">
+                  Password
+                </label>
+                <div className="relative">
+                  <input
+                    id="password"
+                    type={showPassword ? 'text' : 'password'}
+                    autoComplete="new-password"
+                    required
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    className={cn('input pr-11')}
+                    placeholder="Min. 8 characters"
+                    disabled={anyLoading}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((v) => !v)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-secondary transition-colors"
+                    aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  >
+                    {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+                <PasswordStrength password={password} />
+              </div>
+
+              {/* Submit */}
+              <button
+                type="submit"
+                disabled={anyLoading || !isFormValid}
+                className="btn-primary w-full justify-center"
+                id="register-submit"
+              >
+                {isSubmitting ? (
+                  <>
+                    <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                    Creating account…
+                  </>
+                ) : (
+                  <>
+                    <UserPlus className="w-4 h-4" />
+                    Create account
+                  </>
+                )}
+              </button>
+            </form>
+          )}
 
           {/* Divider */}
           <div className="relative">
