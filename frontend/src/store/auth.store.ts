@@ -28,14 +28,20 @@ interface AuthState {
   init: () => Promise<void>;
 
   /**
-   * register — creates an unverified account.
-   * Phase 11: no longer issues tokens or logs the user in.
-   * Returns the message to display ("check your email").
-   * The frontend shows a success state and does NOT redirect to dashboard.
+   * register — creates an unverified account and sends verification email.
+   *
+   * Phase 12: registration is now atomic with respect to email delivery.
+   * Returns { message, email } on success (email sent, frontend navigates to /verify-pending).
+   * Throws ApiError with code='EMAIL_SEND_FAILED' if account was created but
+   * email send failed (frontend shows inline error + resend action, not a full re-submit).
    */
   register: (data: RegisterRequest) => Promise<{ message: string; email: string }>;
 
-  /** login — authenticates, sets access+refresh cookies, populates user state */
+  /**
+   * login — authenticates and sets access+refresh cookies.
+   * Phase 12: throws ApiError with code='EMAIL_NOT_VERIFIED' (403) if the
+   * account has correct credentials but email is not yet verified.
+   */
   login: (data: LoginRequest) => Promise<void>;
 
   /** loginWithGoogle — sends GIS ID token to backend, three-case upsert, sets cookies */
@@ -46,7 +52,11 @@ interface AuthState {
 
   /**
    * resendVerification — requests a new verification email for the given address.
-   * Anti-enumeration: always succeeds regardless of whether email exists.
+   *
+   * Phase 12: now throws on EMAIL_SEND_FAILED so the UI can show a specific
+   * error with retry action, rather than silently succeeding or failing.
+   * Anti-enumeration: if the email is unknown or already verified, the backend
+   * returns 200 and this resolves normally (caller cannot distinguish).
    */
   resendVerification: (email: string) => Promise<void>;
 }
@@ -120,8 +130,11 @@ export const useAuthStore = create<AuthState>((set) => ({
   },
 
   resendVerification: async (email: string) => {
+    // Phase 12: propagate errors so the UI can distinguish success from failure.
+    // The backend returns EMAIL_SEND_FAILED (500) on provider errors, which the
+    // ApiError carries as err.code. Anti-enumeration: unknown/already-verified
+    // emails still return 200 — those resolve normally here.
     await api.post('/api/auth/resend-verification', { email });
-    // Always succeeds from the client's perspective (anti-enumeration)
   },
 }));
 
