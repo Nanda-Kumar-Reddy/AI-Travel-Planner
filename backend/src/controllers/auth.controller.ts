@@ -2,7 +2,7 @@ import { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { OAuth2Client } from 'google-auth-library';
-import { User } from '../models/User';
+import { User, IUser } from '../models/User';
 import { RefreshToken } from '../models/RefreshToken';
 import { AppError } from '../utils/errors';
 import { catchAsync } from '../utils/errors';
@@ -98,6 +98,16 @@ async function issueTokenPair(
 }
 
 // ─── POST /api/auth/register ──────────────────────────────────────────────────
+//
+// Phase 12 change: registration is now atomic with respect to email delivery.
+// The 201 response is only issued if the verification email actually sends.
+// On send failure the user record still exists (not lost), but the response
+// returns EMAIL_SEND_FAILED so the frontend can surface a targeted retry action.
+//
+// Existing-unverified-account case: if someone abandoned a previous registration
+// after a failed email send, we reuse the existing record (fresh token + resend)
+// rather than creating a duplicate or erroring "already in use".
+//
 export const register = catchAsync(async (req: Request, res: Response): Promise<void> => {
   const { email, name, password } = req.body as {
     email?: string;
@@ -115,49 +125,94 @@ export const register = catchAsync(async (req: Request, res: Response): Promise<
     throw new AppError('Name must be at least 2 characters.', 400);
   }
 
-  // Use generic message to prevent email enumeration
-  const existing = await User.findOne({ email: email.toLowerCase().trim() });
-  if (existing) {
+  const normalizedEmail = email.toLowerCase().trim();
+
+  const existing = await User.findOne({ email: normalizedEmail });
+
+  // Case A: already has a verified account → block (anti-enumeration: same message
+  // as a new account, except we must distinguish from the unverified case below).
+  if (existing && existing.emailVerified) {
     throw new AppError('An account with that email already exists.', 400);
   }
 
-  const passwordHash = await bcrypt.hash(password, 12);
+  let user: IUser;
+  let rawVerifyToken: string;
 
-  // Generate email verification token
-  const rawVerifyToken = generateSecureToken();
-  const verifyTokenHash = hashToken(rawVerifyToken);
-  const verifyExpiresAt = new Date(Date.now() + EMAIL_VERIFY_EXPIRY_MS);
+  if (existing && !existing.emailVerified) {
+    // Case B: prior registration, email never verified (abandoned or failed send).
+    // Reuse the record — just regenerate the token and attempt a fresh send.
+    rawVerifyToken = generateSecureToken();
+    const verifyTokenHash = hashToken(rawVerifyToken);
+    const verifyExpiresAt = new Date(Date.now() + EMAIL_VERIFY_EXPIRY_MS);
 
-  const user = await User.create({
-    email: email.toLowerCase().trim(),
-    name: name.trim(),
-    passwordHash,
-    emailVerified: false,
-    emailVerificationTokenHash: verifyTokenHash,
-    emailVerificationExpiresAt: verifyExpiresAt,
-  });
+    await User.findByIdAndUpdate(existing._id, {
+      emailVerificationTokenHash: verifyTokenHash,
+      emailVerificationExpiresAt: verifyExpiresAt,
+    });
 
-  // Send verification email.
-  // In mock mode (EMAIL_MODE=mock or unset): logs the link to the console.
-  // In live mode (EMAIL_MODE=live): sends via Gmail SMTP (nodemailer).
-  // We fire-and-forget in a try/catch so email failure doesn't block the
-  // 201 response — the user can always resend via /api/auth/resend-verification.
-  emailService.sendVerificationEmail(user.email, rawVerifyToken).catch((err) => {
-    logger.error('[EMAIL] Failed to send verification email on register:', err);
-  });
+    user = existing;
+    logger.info(`[AUTH] Re-registration for unverified account: ${normalizedEmail} — refreshing token`);
+  } else {
+    // Case C: brand-new account.
+    const passwordHash = await bcrypt.hash(password, 12);
+    rawVerifyToken = generateSecureToken();
+    const verifyTokenHash = hashToken(rawVerifyToken);
+    const verifyExpiresAt = new Date(Date.now() + EMAIL_VERIFY_EXPIRY_MS);
 
-  logger.info(`[AUTH] New registration: ${user.email} — verification email queued`);
+    user = (await User.create({
+      email: normalizedEmail,
+      name: name.trim(),
+      passwordHash,
+      emailVerified: false,
+      emailVerificationTokenHash: verifyTokenHash,
+      emailVerificationExpiresAt: verifyExpiresAt,
+    })) as IUser;
 
-  // Registration does NOT issue tokens — user must verify email (or just log in
-  // with the non-blocking banner experience). The 201 body contains only the
-  // "check your email" message so the frontend can show the success state.
+    logger.info(`[AUTH] New registration: ${normalizedEmail}`);
+  }
+
+  // Phase 12: await the email send — registration only reports success if the
+  // email actually dispatches. On provider failure we return EMAIL_SEND_FAILED
+  // (the user record exists, they can retry via the resend endpoint).
+  try {
+    await emailService.sendVerificationEmail(user.email, rawVerifyToken);
+    logger.info(`[AUTH] Verification email sent to ${user.email}`);
+  } catch (emailErr) {
+    // Log the real provider error server-side only — never expose it to the client.
+    logger.error('[EMAIL] Failed to send verification email on register:', emailErr);
+
+    // The user record exists but email delivery failed. The frontend surfaces a
+    // targeted retry action (calls /api/auth/resend-verification) rather than
+    // making the user re-fill the form.
+    res.status(500).json({
+      error: 'Your account was created, but we couldn\'t send the verification email. Please try again.',
+      code: 'EMAIL_SEND_FAILED',
+      email: user.email,
+    });
+    return;
+  }
+
+  // Registration does NOT issue tokens — user must verify email first.
   res.status(201).json({
-    message: 'Account created. Check your email (or the server console in mock mode) for your verification link.',
+    message: 'Account created. Check your email for your verification link.',
     email: user.email,
   });
 });
 
 // ─── POST /api/auth/login ─────────────────────────────────────────────────────
+//
+// Phase 12 change: email verification is now a hard gate, unconditional.
+// Previously opt-in via EMAIL_VERIFY_REQUIRED=true; now always enforced.
+//
+// Anti-enumeration strategy:
+//   - No user found OR wrong password → 401 with the SAME generic message.
+//     This prevents attackers from learning whether an email is registered.
+//   - Correct password BUT unverified email → 403 with a DISTINCT message.
+//     This is safe: the credentials are correct, so the user already knows
+//     their email is registered here. The 403 + specific code lets the
+//     frontend surface a targeted "resend verification" action instead of
+//     the confusing generic "invalid credentials" message.
+//
 export const login = catchAsync(async (req: Request, res: Response): Promise<void> => {
   const { email, password } = req.body as { email?: string; password?: string };
 
@@ -183,12 +238,13 @@ export const login = catchAsync(async (req: Request, res: Response): Promise<voi
     throw new AppError(INVALID_CREDENTIALS, 401);
   }
 
-  // Non-blocking email verification: we let users in but the response includes
-  // emailVerified so the frontend can show the reminder banner.
-  // Hard block is opt-in via EMAIL_VERIFY_REQUIRED=true env var.
-  if (!user.emailVerified && process.env.EMAIL_VERIFY_REQUIRED === 'true') {
+  // Phase 12: Hard gate — unverified accounts cannot receive tokens.
+  // 403 (not 401): the identity is confirmed, but access is forbidden until verified.
+  // The distinct code lets the frontend branch to a "resend verification" UX
+  // rather than showing the misleading generic "invalid credentials" message.
+  if (!user.emailVerified) {
     throw new AppError(
-      'Please verify your email before logging in. Check your inbox for the verification link, or request a new one.',
+      'Please verify your email before signing in.',
       403,
       'EMAIL_NOT_VERIFIED'
     );
@@ -348,6 +404,15 @@ export const verifyEmail = catchAsync(async (req: Request, res: Response): Promi
 });
 
 // ─── POST /api/auth/resend-verification ───────────────────────────────────────
+//
+// Phase 12 change: now awaits the email send and returns EMAIL_SEND_FAILED on
+// provider errors so the frontend can surface a retry action instead of
+// silently failing.
+//
+// Anti-enumeration: unknown emails and already-verified accounts still get a
+// generic 200 (the caller can't distinguish "user not found" from "already
+// verified" from "email sent"). Only real send failures get a distinct error.
+//
 export const resendVerification = catchAsync(async (req: Request, res: Response): Promise<void> => {
   const { email } = req.body as { email?: string };
 
@@ -355,16 +420,15 @@ export const resendVerification = catchAsync(async (req: Request, res: Response)
     throw new AppError('Email address is required.', 400);
   }
 
-  // Always return the same message — prevents email enumeration
-  const SAFE_RESPONSE = {
-    message: 'If that email exists and is unverified, a new verification link has been sent. Check the server console if EMAIL_MODE=mock.',
-  };
-
   const user = await User.findOne({ email: email.toLowerCase().trim() })
     .select('+emailVerificationTokenHash +emailVerificationExpiresAt');
 
+  // Anti-enumeration: if the email doesn't exist or is already verified,
+  // return the same generic 200 the caller would see on a real send.
   if (!user || user.emailVerified) {
-    res.status(200).json(SAFE_RESPONSE);
+    res.status(200).json({
+      message: 'If that email is registered and unverified, a new link has been sent.',
+    });
     return;
   }
 
@@ -377,12 +441,22 @@ export const resendVerification = catchAsync(async (req: Request, res: Response)
     emailVerificationExpiresAt: verifyExpiresAt,
   });
 
-  emailService.sendVerificationEmail(user.email, rawVerifyToken).catch((err) => {
-    logger.error('[EMAIL] Failed to resend verification email:', err);
-  });
+  try {
+    await emailService.sendVerificationEmail(user.email, rawVerifyToken);
+    logger.info(`[AUTH] Verification email resent to ${user.email}`);
+    res.status(200).json({
+      message: 'Verification email sent. Check your inbox.',
+    });
+  } catch (emailErr) {
+    // Log the real provider error server-side only.
+    logger.error('[EMAIL] Failed to resend verification email:', emailErr);
 
-  logger.info(`[AUTH] Verification email resent to ${user.email}`);
-  res.status(200).json(SAFE_RESPONSE);
+    // Distinct error so the frontend can show a retry action, not a silent failure.
+    res.status(500).json({
+      error: 'We couldn\'t send the verification email. Please try again.',
+      code: 'EMAIL_SEND_FAILED',
+    });
+  }
 });
 
 // ─── POST /api/auth/google ────────────────────────────────────────────────────
