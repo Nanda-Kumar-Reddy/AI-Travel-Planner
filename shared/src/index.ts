@@ -84,6 +84,8 @@ export interface User {
   _id: string;
   email: string;
   name: string;
+  emailVerified?: boolean;   // Phase 11: false until email link is clicked
+  googleId?: string;          // Phase 11: set for Google OAuth users
   createdAt: string;
 }
 
@@ -95,6 +97,12 @@ export interface RegisterRequest {
   password: string;
 }
 
+// Phase 11: registration returns a message, not a user+cookie
+export interface RegisterResponse {
+  message: string;
+  email: string;
+}
+
 export interface LoginRequest {
   email: string;
   password: string;
@@ -102,6 +110,11 @@ export interface LoginRequest {
 
 export interface AuthResponse {
   user: User;
+}
+
+// Phase 11: Google sign-in sends the ID token from GIS
+export interface GoogleAuthRequest {
+  idToken: string;
 }
 
 export interface CreateTripRequest {
