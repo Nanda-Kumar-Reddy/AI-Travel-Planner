@@ -4,7 +4,7 @@ import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import {
-  LogOut, Plane, Plus, MapPin, Calendar, Clock, TrendingUp, Trash2,
+  LogOut, Plane, Plus, MapPin, Calendar, Clock, TrendingUp, Trash2, AlertTriangle, X,
 } from 'lucide-react';
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
 import { ProtectedRoute } from '../../components/auth/ProtectedRoute';
@@ -15,17 +15,124 @@ import { formatDate, formatUSD, cn } from '../../lib/utils';
 import { ScoreRing, FlagChips, type FlagLike } from '../../components/risk/RiskComponents';
 import type { Trip } from '../../../../shared/src/index';
 
+// ── Delete confirm modal ──────────────────────────────────────────────────────
+interface DeleteConfirmModalProps {
+  destination: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+  isDeleting: boolean;
+}
+function DeleteConfirmModal({ destination, onConfirm, onCancel, isDeleting }: DeleteConfirmModalProps) {
+  const prefersReduced = useReducedMotion();
+  return (
+    <>
+      {/* Backdrop */}
+      <motion.div
+        key="delete-backdrop"
+        className="fixed inset-0 z-50 flex items-center justify-center px-4"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        style={{ background: 'rgba(0,0,0,0.65)', backdropFilter: 'blur(6px)' }}
+        onClick={onCancel}
+      >
+        {/* Panel */}
+        <motion.div
+          key="delete-panel"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-modal-title"
+          className="relative w-full max-w-sm rounded-2xl p-6 shadow-2xl"
+          style={{
+            background: 'var(--color-surface)',
+            border: '1px solid var(--color-border)',
+          }}
+          initial={prefersReduced ? { opacity: 0 } : { opacity: 0, scale: 0.92, y: 16 }}
+          animate={prefersReduced ? { opacity: 1 } : { opacity: 1, scale: 1, y: 0 }}
+          exit={prefersReduced ? { opacity: 0 } : { opacity: 0, scale: 0.94, y: 8 }}
+          transition={prefersReduced ? { duration: 0.15 } : { type: 'spring', stiffness: 380, damping: 28 }}
+          onClick={e => e.stopPropagation()}
+        >
+          {/* Close */}
+          <button
+            onClick={onCancel}
+            disabled={isDeleting}
+            className="absolute top-4 right-4 btn-ghost p-1.5"
+            aria-label="Close"
+          >
+            <X size={16} />
+          </button>
+
+          {/* Icon */}
+          <div
+            className="w-12 h-12 rounded-xl flex items-center justify-center mb-4"
+            style={{
+              background: 'rgba(var(--color-risk-high-rgb), 0.10)',
+              border: '1px solid rgba(var(--color-risk-high-rgb), 0.25)',
+            }}
+          >
+            <AlertTriangle size={22} style={{ color: 'var(--color-risk-high)' }} />
+          </div>
+
+          <h3
+            id="delete-modal-title"
+            className="font-display font-bold text-lg mb-1"
+            style={{ color: 'var(--color-text-primary)' }}
+          >
+            Delete trip?
+          </h3>
+          <p className="text-sm mb-6" style={{ color: 'var(--color-text-secondary)' }}>
+            <span className="font-semibold" style={{ color: 'var(--color-text-primary)' }}>{destination}</span> will be permanently removed. This cannot be undone.
+          </p>
+
+          <div className="flex gap-3">
+            <button
+              onClick={onCancel}
+              disabled={isDeleting}
+              className="btn-secondary flex-1 justify-center"
+              id="delete-modal-cancel"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={onConfirm}
+              disabled={isDeleting}
+              className="flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-sm font-semibold text-white transition-all"
+              style={{
+                background: isDeleting
+                  ? 'rgba(var(--color-risk-high-rgb), 0.5)'
+                  : 'var(--color-risk-high)',
+              }}
+              id="delete-modal-confirm"
+            >
+              {isDeleting ? (
+                <><span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />Deleting…</>
+              ) : (
+                <><Trash2 size={14} />Delete Trip</>
+              )}
+            </button>
+          </div>
+        </motion.div>
+      </motion.div>
+    </>
+  );
+}
+
 // ── Trip card ─────────────────────────────────────────────────────────────────
 function TripCard({ trip, onDelete }: { trip: Trip; onDelete: (id: string) => void }) {
   const [deleting, setDeleting] = useState(false);
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
   const prefersReduced = useReducedMotion();
 
-  const handleDelete = async (e: React.MouseEvent) => {
+  const handleDeleteClick = (e: React.MouseEvent) => {
     e.preventDefault();
-    if (!confirm(`Delete trip to ${trip.destination}? This cannot be undone.`)) return;
+    setShowDeleteModal(true);
+  };
+
+  const handleConfirmDelete = async () => {
     setDeleting(true);
     try { await api.delete(`/api/trips/${trip._id}`); onDelete(trip._id); }
-    catch { setDeleting(false); }
+    catch { setDeleting(false); setShowDeleteModal(false); }
   };
 
   const score = trip.confidenceScore ?? 100;
@@ -111,7 +218,7 @@ function TripCard({ trip, onDelete }: { trip: Trip; onDelete: (id: string) => vo
             {trip.status}
           </span>
           <button
-            onClick={handleDelete}
+            onClick={handleDeleteClick}
             disabled={deleting}
             className="opacity-0 group-hover:opacity-100 btn-ghost py-1 px-2 text-xs transition-opacity"
             style={{ color: 'var(--color-risk-high)' }}
@@ -122,6 +229,17 @@ function TripCard({ trip, onDelete }: { trip: Trip; onDelete: (id: string) => vo
           </button>
         </div>
       </Link>
+
+      <AnimatePresence>
+        {showDeleteModal && (
+          <DeleteConfirmModal
+            destination={trip.destination}
+            onConfirm={handleConfirmDelete}
+            onCancel={() => setShowDeleteModal(false)}
+            isDeleting={deleting}
+          />
+        )}
+      </AnimatePresence>
     </motion.div>
   );
 }

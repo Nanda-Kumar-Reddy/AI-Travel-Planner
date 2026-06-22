@@ -3,7 +3,7 @@
 > Generate day-by-day travel itineraries with AI, get a real-time confidence score, and let the Risk Co-Pilot flag pacing problems, budget overruns, and weather risks — with one-click AI fixes.
 
 **Live URLs:**
-- **Frontend:** https://ai-travel-planner-eight-iota.vercel.app
+- **Frontend:** https://ai-travel-planner-xi-one.vercel.app/
 - **Backend API:** https://ai-travel-planner-j6r3.onrender.com/health
 
 > ⚠️ The backend runs on Render's free tier. If the health check returns slowly (20–40 seconds), the instance is cold-starting. Subsequent requests are fast.
