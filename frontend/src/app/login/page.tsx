@@ -1,25 +1,71 @@
 'use client';
 
-import { useState, useEffect, Suspense } from 'react';
+import { useState, useEffect, useCallback, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Eye, EyeOff, LogIn, Plane } from 'lucide-react';
 import { useAuthStore, ApiError } from '../../store/auth.store';
 import { cn } from '../../lib/utils';
 
-// Inner component — uses useSearchParams(), must be inside <Suspense>
+
+
+function GoogleSignInButton({ onSuccess, onError }: {
+  onSuccess: (idToken: string) => void;
+  onError: (msg: string) => void;
+}) {
+  const containerRef = useCallback((node: HTMLDivElement | null) => {
+    if (!node) return;
+    const clientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
+    if (!clientId || !window.google?.accounts?.id) return;
+
+    window.google.accounts.id.initialize({
+      client_id: clientId,
+      callback: (response) => {
+        if (response.credential) {
+          onSuccess(response.credential);
+        } else {
+          onError('Google sign-in did not return a credential. Please try again.');
+        }
+      },
+    });
+
+    window.google.accounts.id.renderButton(node, {
+      theme: 'outline',
+      size: 'large',
+      text: 'signin_with',
+      width: node.offsetWidth || 380,
+      shape: 'rectangular',
+    });
+  }, [onSuccess, onError]);
+
+  const clientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
+  if (!clientId) return null; // Google Sign-In not configured — hide button entirely
+
+  return (
+    <>
+      {/* Load GIS script — only when GOOGLE_CLIENT_ID is set */}
+      {/* eslint-disable-next-line @next/next/no-sync-scripts */}
+      <script src="https://accounts.google.com/gsi/client" async defer />
+      <div ref={containerRef} id="google-signin-button" className="w-full" />
+    </>
+  );
+}
+
+// ── Login Form ────────────────────────────────────────────────────────────────
+
 function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const returnTo = searchParams.get('returnTo') || '/dashboard';
 
-  const { login, user, isLoading } = useAuthStore();
+  const { login, loginWithGoogle, user, isLoading } = useAuthStore();
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isGoogleLoading, setIsGoogleLoading] = useState(false);
 
   // If already authenticated, redirect immediately
   useEffect(() => {
@@ -46,6 +92,27 @@ function LoginForm() {
       setIsSubmitting(false);
     }
   };
+
+  const handleGoogleSuccess = async (idToken: string) => {
+    setError('');
+    setIsGoogleLoading(true);
+    try {
+      await loginWithGoogle(idToken);
+      router.replace(decodeURIComponent(returnTo));
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setError(err.message);
+      } else {
+        setError('Google sign-in failed. Please try again.');
+      }
+    } finally {
+      setIsGoogleLoading(false);
+    }
+  };
+
+  const handleGoogleError = (msg: string) => setError(msg);
+
+  const anyLoading = isLoading || isSubmitting || isGoogleLoading;
 
   return (
     <main className="min-h-screen bg-void flex items-center justify-center px-4 py-12">
@@ -84,13 +151,31 @@ function LoginForm() {
             </div>
           )}
 
+          {/* Google Sign-In */}
+          <div className="space-y-3">
+            <GoogleSignInButton onSuccess={handleGoogleSuccess} onError={handleGoogleError} />
+            {isGoogleLoading && (
+              <div className="flex items-center justify-center gap-2 text-sm text-text-muted">
+                <span className="w-4 h-4 border-2 border-accent/30 border-t-accent rounded-full animate-spin" />
+                Signing in with Google…
+              </div>
+            )}
+          </div>
+
+          {/* Divider */}
+          <div className="relative">
+            <div className="absolute inset-0 flex items-center">
+              <div className="w-full border-t border-border" />
+            </div>
+            <div className="relative flex justify-center text-xs text-text-muted">
+              <span className="bg-surface px-2">or sign in with email</span>
+            </div>
+          </div>
+
           <form onSubmit={handleSubmit} className="space-y-4" noValidate>
             {/* Email */}
             <div className="space-y-1.5">
-              <label
-                htmlFor="email"
-                className="block text-sm font-medium text-text-secondary"
-              >
+              <label htmlFor="email" className="block text-sm font-medium text-text-secondary">
                 Email address
               </label>
               <input
@@ -102,16 +187,13 @@ function LoginForm() {
                 onChange={(e) => setEmail(e.target.value)}
                 className="input"
                 placeholder="you@example.com"
-                disabled={isSubmitting}
+                disabled={anyLoading}
               />
             </div>
 
             {/* Password */}
             <div className="space-y-1.5">
-              <label
-                htmlFor="password"
-                className="block text-sm font-medium text-text-secondary"
-              >
+              <label htmlFor="password" className="block text-sm font-medium text-text-secondary">
                 Password
               </label>
               <div className="relative">
@@ -124,7 +206,7 @@ function LoginForm() {
                   onChange={(e) => setPassword(e.target.value)}
                   className={cn('input pr-11')}
                   placeholder="••••••••"
-                  disabled={isSubmitting}
+                  disabled={anyLoading}
                 />
                 <button
                   type="button"
@@ -132,11 +214,7 @@ function LoginForm() {
                   className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-secondary transition-colors"
                   aria-label={showPassword ? 'Hide password' : 'Show password'}
                 >
-                  {showPassword ? (
-                    <EyeOff className="w-4 h-4" />
-                  ) : (
-                    <Eye className="w-4 h-4" />
-                  )}
+                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 </button>
               </div>
             </div>
@@ -144,7 +222,7 @@ function LoginForm() {
             {/* Submit */}
             <button
               type="submit"
-              disabled={isSubmitting || !email || !password}
+              disabled={anyLoading || !email || !password}
               className="btn-primary w-full justify-center"
               id="login-submit"
             >
