@@ -4,6 +4,9 @@
   "installCommand": "cd frontend && npm install",
   "framework": "nextjs",
   "rewrites": [
-    { "source": "/(.*)", "destination": "/$1" }
+    {
+      "source": "/(.*)",
+      "destination": "/$1"
+    }
   ]
 }
