@@ -1,27 +1,10 @@
 'use client';
 
 import Link from 'next/link';
-import dynamic from 'next/dynamic';
 import { motion, useReducedMotion } from 'framer-motion';
 import { Plane, Sparkles, Shield, TrendingUp, ChevronRight, MapPin } from 'lucide-react';
 import { ThemeToggle } from '../components/theme/ThemeToggle';
-
-// ── Globe fallback (shown while WebGL loads) ───────────────────────────────────────
-function GlobeFallback({ size }: { size: number }) {
-  return (
-    <div
-      className="rounded-full skeleton"
-      style={{ width: size, height: size }}
-      aria-hidden="true"
-    />
-  );
-}
-
-// next/dynamic with ssr:false — avoids WebGL SSR crash
-const GlobeScene = dynamic(
-  () => import('../components/globe/GlobeScene').then((m) => m.GlobeScene),
-  { ssr: false, loading: () => <GlobeFallback size={420} /> }
-);
+import { GlobeScene } from '../components/globe/GlobeScene';
 
 // ── Animation variants ────────────────────────────────────────────────────────
 const heroContainer = {

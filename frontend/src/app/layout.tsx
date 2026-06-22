@@ -59,7 +59,7 @@ export default function RootLayout({
           dangerouslySetInnerHTML={{ __html: antiFlashScript }}
         />
       </head>
-      <body className="antialiased" style={{ fontFamily: 'var(--font-body)' }}>
+      <body className="antialiased" style={{ fontFamily: 'var(--font-body)' }} suppressHydrationWarning>
         <ThemeProvider>
           {/* AuthProvider runs init() on mount to restore session from httpOnly cookie */}
           <AuthProvider>

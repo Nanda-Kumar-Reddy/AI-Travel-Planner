@@ -1,145 +1,8 @@
 'use client';
 
-import { useRef, useMemo } from 'react';
-import { Canvas, useFrame } from '@react-three/fiber';
 import { useTheme } from 'next-themes';
-import * as THREE from 'three';
 
-// ── Globe mesh ────────────────────────────────────────────────────────────────
-function GlobeMesh({ isDark }: { isDark: boolean }) {
-  const meshRef = useRef<THREE.Mesh>(null);
-  const atmosphereRef = useRef<THREE.Mesh>(null);
-
-  // Theme-aware colors
-  const oceanColor  = isDark ? '#0f172a' : '#bfdbfe';
-  const landColor   = isDark ? '#312e81' : '#6366f1';
-  const atmosColor  = isDark ? '#6366f1' : '#818cf8';
-  const atmosOpacity = isDark ? 0.18 : 0.28;
-  const gridColor   = isDark ? '#4f46e5' : '#818cf8';
-  const gridOpacity = isDark ? 0.15 : 0.12;
-
-  // Procedural lat/lon grid texture
-  const gridTexture = useMemo(() => {
-    const size = 512;
-    const canvas = document.createElement('canvas');
-    canvas.width = size;
-    canvas.height = size;
-    const ctx = canvas.getContext('2d')!;
-
-    // Fill ocean
-    ctx.fillStyle = oceanColor;
-    ctx.fillRect(0, 0, size, size);
-
-    // Lat/lon grid
-    ctx.strokeStyle = gridColor;
-    ctx.globalAlpha = gridOpacity;
-    ctx.lineWidth = 0.8;
-    const latLines = 12;
-    const lonLines = 24;
-    for (let i = 0; i <= latLines; i++) {
-      const y = (i / latLines) * size;
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(size, y); ctx.stroke();
-    }
-    for (let i = 0; i <= lonLines; i++) {
-      const x = (i / lonLines) * size;
-      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, size); ctx.stroke();
-    }
-
-    // Stylised land masses (simplified blobs)
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = landColor;
-
-    // North America
-    ctx.beginPath();
-    ctx.ellipse(100, 180, 60, 70, -0.2, 0, Math.PI * 2);
-    ctx.fill();
-    // Europe
-    ctx.beginPath();
-    ctx.ellipse(275, 155, 32, 38, 0.1, 0, Math.PI * 2);
-    ctx.fill();
-    // Africa
-    ctx.beginPath();
-    ctx.ellipse(280, 265, 40, 65, 0, 0, Math.PI * 2);
-    ctx.fill();
-    // Asia
-    ctx.beginPath();
-    ctx.ellipse(370, 165, 80, 60, 0, 0, Math.PI * 2);
-    ctx.fill();
-    // Australia
-    ctx.beginPath();
-    ctx.ellipse(410, 300, 35, 28, 0.3, 0, Math.PI * 2);
-    ctx.fill();
-    // South America
-    ctx.beginPath();
-    ctx.ellipse(155, 300, 32, 55, 0.1, 0, Math.PI * 2);
-    ctx.fill();
-
-    const tex = new THREE.CanvasTexture(canvas);
-    tex.needsUpdate = true;
-    return tex;
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isDark]);
-
-  // Slow auto-rotation
-  useFrame((_, delta) => {
-    if (meshRef.current) {
-      meshRef.current.rotation.y += delta * 0.08;
-    }
-    if (atmosphereRef.current) {
-      atmosphereRef.current.rotation.y += delta * 0.06;
-    }
-  });
-
-  return (
-    <>
-      {/* Atmosphere shell — slightly larger than globe */}
-      <mesh ref={atmosphereRef}>
-        <sphereGeometry args={[1.06, 64, 64]} />
-        <meshPhongMaterial
-          color={atmosColor}
-          transparent
-          opacity={atmosOpacity}
-          side={THREE.BackSide}
-          depthWrite={false}
-        />
-      </mesh>
-
-      {/* Globe sphere */}
-      <mesh ref={meshRef}>
-        <sphereGeometry args={[1, 64, 64]} />
-        <meshPhongMaterial map={gridTexture} />
-      </mesh>
-    </>
-  );
-}
-
-// ── Scene lighting ────────────────────────────────────────────────────────────
-function Lights({ isDark }: { isDark: boolean }) {
-  const ambientIntensity    = isDark ? 0.15 : 0.55;
-  const directionalIntensity = isDark ? 0.85 : 1.25;
-  const rimIntensity         = isDark ? 0.3  : 0.15;
-
-  return (
-    <>
-      <ambientLight intensity={ambientIntensity} />
-      <directionalLight
-        position={[3, 2, 3]}
-        intensity={directionalIntensity}
-        color={isDark ? '#c7d2fe' : '#fef3c7'}
-      />
-      {/* Rim light from left for depth */}
-      <directionalLight
-        position={[-3, 0, -2]}
-        intensity={rimIntensity}
-        color={isDark ? '#6366f1' : '#818cf8'}
-      />
-    </>
-  );
-}
-
-// ── Public component ──────────────────────────────────────────────────────────
 interface GlobeSceneProps {
-  /** Canvas size in px; drops to 300 on mobile (< 640px) */
   size?: number;
   className?: string;
 }
@@ -148,29 +11,133 @@ export function GlobeScene({ size = 480, className = '' }: GlobeSceneProps) {
   const { resolvedTheme } = useTheme();
   const isDark = resolvedTheme !== 'light';
 
+  const ocean  = isDark ? '#0f172a' : '#bfdbfe';
+  const land   = isDark ? '#312e81' : '#6366f1';
+  const grid   = isDark ? 'rgba(99,102,241,0.22)' : 'rgba(99,102,241,0.18)';
+  const atmos  = isDark ? 'rgba(99,102,241,0.16)' : 'rgba(129,140,248,0.20)';
+  const glow   = isDark
+    ? '0 0 60px 20px rgba(99,102,241,0.18), inset 0 0 40px rgba(99,102,241,0.08)'
+    : '0 0 50px 15px rgba(129,140,248,0.22), inset 0 0 30px rgba(129,140,248,0.10)';
+
+  const gridSize = Math.round(size / 9);
+  const animDur  = 22; // seconds per full rotation
+
   return (
     <div
-      className={`relative rounded-full overflow-hidden ${className}`}
-      style={{ width: size, height: size }}
+      className={className}
+      style={{ width: size, height: size, position: 'relative' }}
       aria-hidden="true"
     >
-      {/* Outer glow ring — theme aware */}
+      <style>{`
+        @keyframes globe-spin {
+          from { background-position-x: 0; }
+          to   { background-position-x: -${size}px; }
+        }
+        @keyframes atmos-pulse {
+          0%, 100% { opacity: 0.55; }
+          50%       { opacity: 1; }
+        }
+        @keyframes continent-drift {
+          from { transform: translateX(0); }
+          to   { transform: translateX(-${size}px); }
+        }
+      `}</style>
+
+      {/* ── Sphere shell ─────────────────────────────────────────────── */}
       <div
-        className="absolute inset-0 rounded-full pointer-events-none z-10"
         style={{
-          boxShadow: isDark
-            ? '0 0 60px 20px rgba(99,102,241,0.18), inset 0 0 40px rgba(99,102,241,0.08)'
-            : '0 0 50px 15px rgba(129,140,248,0.22), inset 0 0 30px rgba(129,140,248,0.10)',
+          width: size,
+          height: size,
+          borderRadius: '50%',
+          overflow: 'hidden',
+          position: 'relative',
+          background: `radial-gradient(circle at 32% 36%, ${land} 0%, ${ocean} 55%)`,
+          boxShadow: glow,
         }}
-      />
-      <Canvas
-        camera={{ position: [0, 0, 2.6], fov: 40 }}
-        style={{ background: 'transparent' }}
-        gl={{ antialias: true, alpha: true }}
       >
-        <Lights isDark={isDark} />
-        <GlobeMesh isDark={isDark} />
-      </Canvas>
+        {/* Scrolling lat/lon grid — simulates rotation */}
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            backgroundImage: `
+              repeating-linear-gradient(0deg,   ${grid} 0, ${grid} 1px, transparent 1px, transparent ${gridSize}px),
+              repeating-linear-gradient(90deg,  ${grid} 0, ${grid} 1px, transparent 1px, transparent ${gridSize}px)
+            `,
+            backgroundSize: `${size}px ${size}px`,
+            animation: `globe-spin ${animDur}s linear infinite`,
+          }}
+        />
+
+        {/* Stylised continent blobs drifting with the rotation */}
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            animation: `continent-drift ${animDur}s linear infinite`,
+          }}
+        >
+          {/* Duplicate strip so the loop is seamless */}
+          {[0, size].map((offset) => (
+            <svg
+              key={offset}
+              viewBox={`0 0 ${size} ${size}`}
+              style={{ position: 'absolute', top: 0, left: offset, width: size, height: size }}
+            >
+              {/* North America */}
+              <ellipse cx={size * 0.20} cy={size * 0.35} rx={size * 0.11} ry={size * 0.13}
+                fill={land} opacity={0.85} transform={`rotate(-12,${size*0.20},${size*0.35})`} />
+              {/* Europe */}
+              <ellipse cx={size * 0.54} cy={size * 0.30} rx={size * 0.06} ry={size * 0.075}
+                fill={land} opacity={0.85} transform={`rotate(8,${size*0.54},${size*0.30})`} />
+              {/* Africa */}
+              <ellipse cx={size * 0.55} cy={size * 0.52} rx={size * 0.078} ry={size * 0.13}
+                fill={land} opacity={0.85} />
+              {/* Asia */}
+              <ellipse cx={size * 0.72} cy={size * 0.32} rx={size * 0.15} ry={size * 0.115}
+                fill={land} opacity={0.85} transform={`rotate(5,${size*0.72},${size*0.32})`} />
+              {/* Australia */}
+              <ellipse cx={size * 0.80} cy={size * 0.59} rx={size * 0.068} ry={size * 0.054}
+                fill={land} opacity={0.80} transform={`rotate(18,${size*0.80},${size*0.59})`} />
+              {/* South America */}
+              <ellipse cx={size * 0.30} cy={size * 0.58} rx={size * 0.062} ry={size * 0.105}
+                fill={land} opacity={0.85} transform={`rotate(8,${size*0.30},${size*0.58})`} />
+            </svg>
+          ))}
+        </div>
+
+        {/* Atmosphere limb on right edge */}
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            background: `radial-gradient(circle at 72% 62%, transparent 38%, ${atmos} 100%)`,
+            animation: `atmos-pulse 4s ease-in-out infinite`,
+          }}
+        />
+
+        {/* Edge vignette — depth illusion */}
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            background: 'radial-gradient(circle at 50% 50%, transparent 46%, rgba(0,0,0,0.42) 100%)',
+          }}
+        />
+
+        {/* Specular highlight */}
+        <div
+          style={{
+            position: 'absolute',
+            top: '12%',
+            left: '14%',
+            width: '32%',
+            height: '26%',
+            borderRadius: '50%',
+            background: 'radial-gradient(ellipse, rgba(255,255,255,0.13) 0%, transparent 70%)',
+          }}
+        />
+      </div>
     </div>
   );
 }
