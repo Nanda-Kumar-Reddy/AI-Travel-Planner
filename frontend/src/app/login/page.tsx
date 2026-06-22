@@ -1,13 +1,14 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Eye, EyeOff, LogIn, Plane } from 'lucide-react';
 import { useAuthStore, ApiError } from '../../store/auth.store';
 import { cn } from '../../lib/utils';
 
-export default function LoginPage() {
+// Inner component — uses useSearchParams(), must be inside <Suspense>
+function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const returnTo = searchParams.get('returnTo') || '/dashboard';
@@ -181,5 +182,24 @@ export default function LoginPage() {
         </div>
       </div>
     </main>
+  );
+}
+
+// Page export wraps LoginForm in Suspense so Next.js can statically
+// generate the page shell without executing useSearchParams() at build time.
+export default function LoginPage() {
+  return (
+    <Suspense
+      fallback={
+        <div
+          className="min-h-screen flex items-center justify-center"
+          style={{ background: 'var(--color-void)' }}
+        >
+          <div className="w-6 h-6 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+        </div>
+      }
+    >
+      <LoginForm />
+    </Suspense>
   );
 }
