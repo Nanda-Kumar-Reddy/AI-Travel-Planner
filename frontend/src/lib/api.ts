@@ -31,7 +31,10 @@ export class ApiError extends Error {
   constructor(
     message: string,
     public statusCode: number,
-    public code?: string
+    public code?: string,
+    // Full response JSON body — allows callers to access extra fields like `email`
+    // that the backend sends alongside `error` and `code`.
+    public data?: Record<string, unknown>
   ) {
     super(message);
     this.name = 'ApiError';
@@ -160,12 +163,16 @@ async function request<T>(endpoint: string, options: RequestOptions = {}, _isRet
       // Refresh failed: user=null has been set, ProtectedRoute will redirect.
       // Fall through to throw the 401 ApiError below.
     }
+    // Note: 403 responses (e.g. EMAIL_NOT_VERIFIED) are intentionally NOT
+    // intercepted here — they are forbidden-action responses, not expired tokens.
+    // They propagate directly to the caller so the UI can branch on the error code.
     // ─────────────────────────────────────────────────────────────────────────
 
     throw new ApiError(
       json?.error || `Request failed with status ${response.status}`,
       response.status,
-      json?.code
+      json?.code,
+      json ?? undefined  // full response body available to callers
     );
   }
 
