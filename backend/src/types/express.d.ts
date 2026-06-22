@@ -1,7 +1,7 @@
 import { Request } from 'express';
 
-// Extend Express Request to carry the authenticated user payload
-// This is populated by the requireAuth middleware after JWT verification
+// Extend Express Request to carry the authenticated user payload.
+// Populated by the requireAuth middleware after access JWT verification.
 export interface AuthenticatedUser {
   id: string;
   email: string;
