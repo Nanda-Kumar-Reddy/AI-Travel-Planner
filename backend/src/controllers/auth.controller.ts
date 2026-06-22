@@ -8,7 +8,7 @@ import { AppError } from '../utils/errors';
 import { catchAsync } from '../utils/errors';
 import { getAuthUser } from '../types/auth.helpers';
 import { generateSecureToken, hashToken } from '../utils/tokens';
-import { sendVerificationEmail, sendWelcomeEmail } from '../services/email.service';
+import { emailService } from '../services/email.service';
 import { logger } from '../utils/logger';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -139,10 +139,10 @@ export const register = catchAsync(async (req: Request, res: Response): Promise<
 
   // Send verification email.
   // In mock mode (EMAIL_MODE=mock or unset): logs the link to the console.
-  // In live mode (EMAIL_MODE=live): sends via Resend.
+  // In live mode (EMAIL_MODE=live): sends via Gmail SMTP (nodemailer).
   // We fire-and-forget in a try/catch so email failure doesn't block the
   // 201 response — the user can always resend via /api/auth/resend-verification.
-  sendVerificationEmail(user.email, rawVerifyToken).catch((err) => {
+  emailService.sendVerificationEmail(user.email, rawVerifyToken).catch((err) => {
     logger.error('[EMAIL] Failed to send verification email on register:', err);
   });
 
@@ -340,7 +340,7 @@ export const verifyEmail = catchAsync(async (req: Request, res: Response): Promi
   logger.info(`[AUTH] Email verified for user ${user._id}`);
 
   // Fire-and-forget welcome email
-  sendWelcomeEmail(user.email, user.name).catch((err) => {
+  emailService.sendWelcomeEmail(user.email, user.name).catch((err) => {
     logger.warn('[EMAIL] Welcome email failed (non-critical):', err);
   });
 
@@ -377,7 +377,7 @@ export const resendVerification = catchAsync(async (req: Request, res: Response)
     emailVerificationExpiresAt: verifyExpiresAt,
   });
 
-  sendVerificationEmail(user.email, rawVerifyToken).catch((err) => {
+  emailService.sendVerificationEmail(user.email, rawVerifyToken).catch((err) => {
     logger.error('[EMAIL] Failed to resend verification email:', err);
   });
 
