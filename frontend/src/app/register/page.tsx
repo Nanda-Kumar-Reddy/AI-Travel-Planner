@@ -186,10 +186,10 @@ export default function RegisterPage() {
                 <span className="text-text-primary font-medium">{registeredEmail}</span>.
                 Click the link to activate your account.
               </p>
-              <p className="text-text-muted text-xs mt-2">
+              {/* <p className="text-text-muted text-xs mt-2">
                 In development / demo mode, the link is logged to the server console
                 (EMAIL_MODE=mock).
-              </p>
+              </p> */}
             </div>
 
             <Link
