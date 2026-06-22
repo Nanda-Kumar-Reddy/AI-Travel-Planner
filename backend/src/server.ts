@@ -27,9 +27,9 @@ function validateEnv(): void {
     'FRONTEND_URL',
   ];
 
-  // Conditional: SMTP credentials only required in live email mode
+  // Conditional: Resend API key only required in live email mode
   if (process.env.EMAIL_MODE === 'live') {
-    required.push('SMTP_USER', 'SMTP_PASS');
+    required.push('RESEND_KEY');
   }
 
   const missing = required.filter((key) => !process.env[key]);
