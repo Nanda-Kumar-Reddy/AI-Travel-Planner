@@ -1,172 +1,199 @@
 /**
- * email.service.ts — transactional email sending with mock mode.
+ * email.service.ts — centralized email sending via Gmail SMTP (nodemailer).
  *
- * EMAIL_MODE controls delivery:
- *   'mock' (default in development): logs the email content + link to the
- *          server console. No external dependency, no deliverability risk
- *          during demos. Same pattern as WEATHER_MOCK from Phase 6.
- *   'live': sends via Resend (https://resend.com). Requires RESEND_API_KEY.
- *           Free tier: 3,000 emails/month, 100/day — generous for a launch.
+ * ALL outgoing emails from this platform must flow through this service.
+ * Do NOT create separate transporters or email logic outside this file.
  *
- * Why Resend over SMTP / SendGrid / Mailgun?
- *   - Simplest setup: one env var, one REST call, no SMTP config
- *   - Generous free tier with no credit card
- *   - Official Node SDK not needed — the REST API is a single fetch call
+ * Adapted from the LifeLine Australia emailService.ts pattern:
+ *   - Singleton transporter (create once, reuse)
+ *   - Shared emailWrapper() layout (dark theme to match this app's brand)
+ *   - Class-based public API, exported as a single instance
  *
- * The mock/live guard means the signup flow NEVER silently breaks because of
- * an email provider issue during a live demo.
+ * What changed from LifeLine:
+ *   - Gmail SMTP credentials read from process.env (SMTP_USER / SMTP_PASS)
+ *     instead of a config object — simpler for this project's structure
+ *   - Added mock/live guard (EMAIL_MODE) so dev/demo never breaks due to
+ *     missing Gmail credentials — same pattern as WEATHER_MOCK from Phase 6
+ *   - Dark theme email template to match the app's visual identity
+ *   - No RESEND — Nodemailer only
+ *
+ * Gmail App Password setup (required for SMTP_PASS):
+ *   Google Account → Security → 2-Step Verification → App Passwords
+ *   Generate one for "Mail / Other (AI Travel Planner)"
+ *   Use that 16-char password as SMTP_PASS (NOT your Google account password)
  */
+import nodemailer from 'nodemailer';
 import { logger } from '../utils/logger';
 
-const RESEND_API_URL = 'https://api.resend.com/emails';
+// ── Config helpers ─────────────────────────────────────────────────────────────
 
 function getEmailMode(): 'mock' | 'live' {
-  const mode = process.env.EMAIL_MODE;
-  if (mode === 'live') return 'live';
-  return 'mock'; // safe default
-}
-
-function getFromAddress(): string {
-  return process.env.EMAIL_FROM || 'AI Travel Planner <noreply@ai-travel-planner.dev>';
+  return process.env.EMAIL_MODE === 'live' ? 'live' : 'mock';
 }
 
 function getFrontendUrl(): string {
+  // FRONTEND_URL can be comma-separated (multiple origins) — take the first
   return (process.env.FRONTEND_URL || 'http://localhost:3000').split(',')[0].trim();
 }
 
-// ─── Internal send helper ─────────────────────────────────────────────────────
+const APP_NAME = 'AI Travel Planner';
 
-async function sendEmail(params: {
-  to: string;
-  subject: string;
-  html: string;
-  logLabel: string;
-  logData?: Record<string, string>;
-}): Promise<void> {
-  if (getEmailMode() === 'mock') {
-    // In mock mode: log everything that would have been emailed.
-    // This keeps the dev/demo flow fully functional without a real email account.
-    logger.info(`[EMAIL MOCK] ═══════════════════════════════════════`);
-    logger.info(`[EMAIL MOCK] To:      ${params.to}`);
-    logger.info(`[EMAIL MOCK] Subject: ${params.subject}`);
-    logger.info(`[EMAIL MOCK] Label:   ${params.logLabel}`);
-    if (params.logData) {
-      for (const [key, value] of Object.entries(params.logData)) {
-        logger.info(`[EMAIL MOCK] ${key}: ${value}`);
-      }
+// ── Singleton transporter ──────────────────────────────────────────────────────
+//
+// Lazily created so the server starts fine even when SMTP credentials are
+// missing (e.g. EMAIL_MODE=mock in development).
+
+let _transporter: nodemailer.Transporter | null = null;
+
+function getTransporter(): nodemailer.Transporter {
+  if (!_transporter) {
+    const user = process.env.SMTP_USER;
+    const pass = process.env.SMTP_PASS;
+
+    if (!user || !pass) {
+      throw new Error(
+        'SMTP_USER and SMTP_PASS must be set when EMAIL_MODE=live.\n' +
+        'Generate a Gmail App Password at: ' +
+        'Google Account → Security → 2-Step Verification → App Passwords'
+      );
     }
-    logger.info(`[EMAIL MOCK] ═══════════════════════════════════════`);
-    return;
+
+    _transporter = nodemailer.createTransport({
+      service: 'gmail',
+      auth: { user, pass },
+    });
   }
-
-  // Live mode: send via Resend REST API
-  const apiKey = process.env.RESEND_API_KEY;
-  if (!apiKey) {
-    throw new Error('RESEND_API_KEY is not set but EMAIL_MODE=live');
-  }
-
-  const response = await fetch(RESEND_API_URL, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      from: getFromAddress(),
-      to: [params.to],
-      subject: params.subject,
-      html: params.html,
-    }),
-  });
-
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Resend API error ${response.status}: ${body}`);
-  }
-
-  logger.info(`[EMAIL] Sent "${params.subject}" to ${params.to}`);
+  return _transporter;
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+// ── Shared email layout (dark theme) ──────────────────────────────────────────
 
-/**
- * sendVerificationEmail — sends the email verification link.
- *
- * In mock mode: logs the full verification URL to the server console.
- * In live mode: sends via Resend.
- */
-export async function sendVerificationEmail(
-  email: string,
-  rawToken: string
-): Promise<void> {
-  const verifyUrl = `${getFrontendUrl()}/verify-email?token=${rawToken}`;
-
-  await sendEmail({
-    to: email,
-    subject: 'Verify your AI Travel Planner email address',
-    logLabel: 'EMAIL VERIFICATION',
-    logData: {
-      'Verify URL (copy into browser)': verifyUrl,
-    },
-    html: `
-      <!DOCTYPE html>
-      <html>
-      <head><meta charset="utf-8"></head>
-      <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 560px; margin: 0 auto; padding: 40px 20px; background: #0a0a0f; color: #e2e8f0;">
-        <div style="background: #13131a; border: 1px solid #1e1e2e; border-radius: 12px; padding: 40px;">
-          <h1 style="color: #818cf8; font-size: 24px; margin: 0 0 8px;">AI Travel Planner</h1>
-          <h2 style="color: #e2e8f0; font-size: 20px; margin: 0 0 24px; font-weight: 500;">Verify your email address</h2>
-          <p style="color: #94a3b8; margin: 0 0 24px; line-height: 1.6;">
-            Thanks for signing up. Click the button below to verify your email address. 
-            This link expires in 24 hours.
-          </p>
-          <a href="${verifyUrl}" 
-             style="display: inline-block; background: #818cf8; color: #ffffff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 15px;">
-            Verify email address
-          </a>
-          <p style="color: #64748b; font-size: 13px; margin: 24px 0 0; line-height: 1.5;">
-            If the button doesn't work, copy this link into your browser:<br>
-            <span style="color: #818cf8; word-break: break-all;">${verifyUrl}</span>
-          </p>
-          <p style="color: #475569; font-size: 12px; margin: 24px 0 0; border-top: 1px solid #1e1e2e; padding-top: 16px;">
-            If you didn't create an account, you can safely ignore this email.
-          </p>
-        </div>
-      </body>
-      </html>
-    `,
-  });
+function emailWrapper(body: string): string {
+  return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${APP_NAME}</title>
+</head>
+<body style="margin:0;padding:0;background:#0a0a0f;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0a0a0f;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <table width="540" cellpadding="0" cellspacing="0"
+               style="background:#13131a;border-radius:12px;overflow:hidden;border:1px solid #1e1e2e;">
+          <!-- Header -->
+          <tr>
+            <td style="background:#1a1a2e;padding:28px 40px;text-align:center;border-bottom:1px solid #1e1e2e;">
+              <span style="color:#818cf8;font-size:22px;font-weight:700;letter-spacing:-0.5px;">
+                ✈ ${APP_NAME}
+              </span>
+            </td>
+          </tr>
+          <!-- Body -->
+          <tr>
+            <td style="padding:36px 40px;color:#e2e8f0;">
+              ${body}
+            </td>
+          </tr>
+          <!-- Footer -->
+          <tr>
+            <td style="background:#0f0f1a;padding:20px 40px;text-align:center;border-top:1px solid #1e1e2e;">
+              <p style="margin:0;font-size:12px;color:#475569;">
+                This email was sent by ${APP_NAME}. If you didn't request this, you can safely ignore it.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
 }
 
-/**
- * sendWelcomeEmail — optional post-verification welcome (fire-and-forget).
- * Not awaited by callers — failure is logged but doesn't surface to the user.
- */
-export async function sendWelcomeEmail(email: string, name: string): Promise<void> {
-  await sendEmail({
-    to: email,
-    subject: 'Welcome to AI Travel Planner 🌍',
-    logLabel: 'WELCOME EMAIL',
-    logData: { 'Recipient name': name },
-    html: `
-      <!DOCTYPE html>
-      <html>
-      <head><meta charset="utf-8"></head>
-      <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 560px; margin: 0 auto; padding: 40px 20px; background: #0a0a0f; color: #e2e8f0;">
-        <div style="background: #13131a; border: 1px solid #1e1e2e; border-radius: 12px; padding: 40px;">
-          <h1 style="color: #818cf8; font-size: 24px; margin: 0 0 8px;">AI Travel Planner</h1>
-          <h2 style="color: #e2e8f0; font-size: 20px; margin: 0 0 16px; font-weight: 500;">Welcome, ${name}! 🎉</h2>
-          <p style="color: #94a3b8; margin: 0 0 24px; line-height: 1.6;">
-            Your email is verified and your account is ready. 
-            Start planning your next adventure with AI-powered day-by-day itineraries and real-time confidence scoring.
-          </p>
-          <a href="${getFrontendUrl()}/dashboard"
-             style="display: inline-block; background: #818cf8; color: #ffffff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; font-size: 15px;">
-            Go to my dashboard
-          </a>
-        </div>
-      </body>
-      </html>
-    `,
-  });
+// ── Primary send helper ────────────────────────────────────────────────────────
+
+async function sendMail(to: string, subject: string, html: string): Promise<void> {
+  const transporter = getTransporter();
+  const from = `"${APP_NAME}" <${process.env.SMTP_USER}>`;
+
+  await transporter.sendMail({ from, to, subject, html });
 }
+
+// ── Email Service ──────────────────────────────────────────────────────────────
+
+class EmailService {
+  /**
+   * sendVerificationEmail — sends the email verification link.
+   *
+   * In mock mode: logs the full verification URL to the server console.
+   * In live mode: sends via Gmail SMTP (nodemailer).
+   */
+  async sendVerificationEmail(to: string, rawToken: string): Promise<void> {
+    const verifyUrl = `${getFrontendUrl()}/verify-email?token=${rawToken}`;
+
+    if (getEmailMode() === 'mock') {
+      logger.info('[EMAIL MOCK] ════════════════════════════════════════');
+      logger.info(`[EMAIL MOCK] To:      ${to}`);
+      logger.info(`[EMAIL MOCK] Subject: Verify your email — ${APP_NAME}`);
+      logger.info(`[EMAIL MOCK] Verify URL (copy into browser):`);
+      logger.info(`[EMAIL MOCK]   ${verifyUrl}`);
+      logger.info('[EMAIL MOCK] ════════════════════════════════════════');
+      return;
+    }
+
+    const body = `
+      <h2 style="margin:0 0 8px;font-size:22px;color:#e2e8f0;font-weight:700;">Verify your email</h2>
+      <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;line-height:1.6;">
+        Welcome to ${APP_NAME}! Click the button below to verify your email address.
+        This link expires in <strong style="color:#e2e8f0;">24 hours</strong>.
+      </p>
+      <div style="text-align:center;margin-bottom:28px;">
+        <a href="${verifyUrl}"
+           style="display:inline-block;background:#818cf8;color:#ffffff;text-decoration:none;padding:14px 32px;border-radius:8px;font-size:15px;font-weight:600;letter-spacing:0.2px;">
+          Verify Email Address
+        </a>
+      </div>
+      <p style="margin:0 0 8px;color:#64748b;font-size:13px;">Or copy and paste this link into your browser:</p>
+      <p style="margin:0;background:#1e1e2e;border-radius:6px;padding:10px 14px;font-size:12px;color:#818cf8;word-break:break-all;">
+        ${verifyUrl}
+      </p>
+      <p style="margin:24px 0 0;color:#475569;font-size:12px;">
+        If you did not create an account, please ignore this email.
+      </p>`;
+
+    await sendMail(to, `Verify your email — ${APP_NAME}`, emailWrapper(body));
+    logger.info(`[EMAIL] Verification email sent to ${to}`);
+  }
+
+  /**
+   * sendWelcomeEmail — post-verification welcome email.
+   * Fire-and-forget — callers should not await this.
+   */
+  async sendWelcomeEmail(to: string, name: string): Promise<void> {
+    if (getEmailMode() === 'mock') {
+      logger.info(`[EMAIL MOCK] Welcome email → ${to} (${name})`);
+      return;
+    }
+
+    const body = `
+      <h2 style="margin:0 0 8px;font-size:22px;color:#e2e8f0;font-weight:700;">Welcome, ${name}! 🎉</h2>
+      <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;line-height:1.6;">
+        Your email is verified and your ${APP_NAME} account is ready.
+        Start planning your next adventure with AI-powered itineraries and real-time risk scoring.
+      </p>
+      <div style="text-align:center;margin-bottom:24px;">
+        <a href="${getFrontendUrl()}/dashboard"
+           style="display:inline-block;background:#818cf8;color:#ffffff;text-decoration:none;padding:14px 32px;border-radius:8px;font-size:15px;font-weight:600;">
+          Go to my dashboard
+        </a>
+      </div>`;
+
+    await sendMail(to, `Welcome to ${APP_NAME} 🌍`, emailWrapper(body));
+    logger.info(`[EMAIL] Welcome email sent to ${to}`);
+  }
+}
+
+export const emailService = new EmailService();
