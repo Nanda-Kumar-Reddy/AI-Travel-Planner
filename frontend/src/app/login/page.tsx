@@ -102,7 +102,7 @@ function LoginForm() {
                 onChange={(e) => setEmail(e.target.value)}
                 className="input"
                 placeholder="you@example.com"
-                disabled={isSubmitting || isLoading}
+                disabled={isSubmitting}
               />
             </div>
 
@@ -124,7 +124,7 @@ function LoginForm() {
                   onChange={(e) => setPassword(e.target.value)}
                   className={cn('input pr-11')}
                   placeholder="••••••••"
-                  disabled={isSubmitting || isLoading}
+                  disabled={isSubmitting}
                 />
                 <button
                   type="button"
@@ -144,7 +144,7 @@ function LoginForm() {
             {/* Submit */}
             <button
               type="submit"
-              disabled={isSubmitting || isLoading || !email || !password}
+              disabled={isSubmitting || !email || !password}
               className="btn-primary w-full justify-center"
               id="login-submit"
             >

@@ -126,7 +126,7 @@ export default function RegisterPage() {
                 onChange={(e) => setName(e.target.value)}
                 className="input"
                 placeholder="Alex Johnson"
-                disabled={isSubmitting || isLoading}
+                disabled={isSubmitting}
                 minLength={2}
               />
             </div>
@@ -145,7 +145,7 @@ export default function RegisterPage() {
                 onChange={(e) => setEmail(e.target.value)}
                 className="input"
                 placeholder="you@example.com"
-                disabled={isSubmitting || isLoading}
+                disabled={isSubmitting}
               />
             </div>
 
@@ -164,7 +164,7 @@ export default function RegisterPage() {
                   onChange={(e) => setPassword(e.target.value)}
                   className={cn('input pr-11')}
                   placeholder="Min. 8 characters"
-                  disabled={isSubmitting || isLoading}
+                  disabled={isSubmitting}
                 />
                 <button
                   type="button"
@@ -181,7 +181,7 @@ export default function RegisterPage() {
             {/* Submit */}
             <button
               type="submit"
-              disabled={isSubmitting || isLoading || !isFormValid}
+              disabled={isSubmitting || !isFormValid}
               className="btn-primary w-full justify-center"
               id="register-submit"
             >
