@@ -10,6 +10,7 @@ import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
 import { ProtectedRoute } from '../../components/auth/ProtectedRoute';
 import { useAuthStore } from '../../store/auth.store';
 import { ThemeToggle } from '../../components/theme/ThemeToggle';
+import { EmailVerificationBanner } from '../../components/auth/EmailVerificationBanner';
 import { api, ApiError } from '../../lib/api';
 import { formatDate, formatUSD, cn } from '../../lib/utils';
 import { ScoreRing, FlagChips, type FlagLike } from '../../components/risk/RiskComponents';
@@ -301,6 +302,9 @@ function DashboardContent() {
 
   return (
     <div className="min-h-screen" style={{ backgroundColor: 'var(--color-void)' }}>
+      {/* Email verification reminder — non-blocking, dismissible */}
+      <EmailVerificationBanner />
+
       {/* Header */}
       <header className="nav-glass sticky top-0 z-40">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
