@@ -27,10 +27,12 @@
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.3.4",
     "node-fetch": "^3.3.2",
+    "nodemailer": "^8.0.11",
     "typescript": "^5.4.5",
     "zod": "^3.22.4"
   },
   "devDependencies": {
+    "@types/nodemailer": "^8.0.1",
     "@typescript-eslint/eslint-plugin": "^7.6.0",
     "@typescript-eslint/parser": "^7.6.0",
     "eslint": "^8.57.0",
