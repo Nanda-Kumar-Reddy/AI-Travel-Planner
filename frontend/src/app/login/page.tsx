@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
-import { Eye, EyeOff, LogIn, Plane } from 'lucide-react';
+import { Eye, EyeOff, LogIn, Plane, AlertCircle, RefreshCw, CheckCircle } from 'lucide-react';
 import { useAuthStore, ApiError } from '../../store/auth.store';
 import { cn } from '../../lib/utils';
 
@@ -51,6 +51,71 @@ function GoogleSignInButton({ onSuccess, onError }: {
   );
 }
 
+// ── Inline resend verification widget — shown on EMAIL_NOT_VERIFIED ───────────
+// Lives on the login form so the user never has to navigate away to retry.
+
+interface InlineResendProps {
+  email: string;
+}
+
+function InlineResendWidget({ email }: InlineResendProps) {
+  type ResendState = 'idle' | 'loading' | 'success' | 'error';
+  const { resendVerification } = useAuthStore();
+  const [state, setState] = useState<ResendState>('idle');
+  const [resendError, setResendError] = useState('');
+
+  const handleResend = async () => {
+    setState('loading');
+    setResendError('');
+    try {
+      await resendVerification(email);
+      setState('success');
+    } catch (err) {
+      setState('error');
+      if (err instanceof ApiError) {
+        setResendError(err.message);
+      } else {
+        setResendError("We couldn't reach the server. Please check your connection and try again.");
+      }
+    }
+  };
+
+  if (state === 'success') {
+    return (
+      <div className="flex items-center gap-2 text-sm text-risk-low justify-center py-1">
+        <CheckCircle className="w-4 h-4 shrink-0" />
+        <span>Email sent — check your inbox.</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {state === 'error' && (
+        <p className="text-xs text-risk-high text-center">{resendError}</p>
+      )}
+      <button
+        onClick={handleResend}
+        disabled={state === 'loading'}
+        className="btn-secondary w-full justify-center text-sm"
+        id="login-resend-verification"
+      >
+        {state === 'loading' ? (
+          <>
+            <span className="w-4 h-4 border-2 border-accent/30 border-t-accent rounded-full animate-spin" />
+            Sending…
+          </>
+        ) : (
+          <>
+            <RefreshCw className="w-4 h-4" />
+            {state === 'error' ? 'Try sending again' : 'Resend verification email'}
+          </>
+        )}
+      </button>
+    </div>
+  );
+}
+
 // ── Login Form ────────────────────────────────────────────────────────────────
 
 function LoginForm() {
@@ -63,7 +128,13 @@ function LoginForm() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+
+  // error: generic message or credential error message
   const [error, setError] = useState('');
+  // emailNotVerified: distinct state for EMAIL_NOT_VERIFIED — show resend widget inline
+  const [emailNotVerified, setEmailNotVerified] = useState(false);
+  const [unverifiedEmail, setUnverifiedEmail] = useState('');
+
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isGoogleLoading, setIsGoogleLoading] = useState(false);
 
@@ -77,6 +148,9 @@ function LoginForm() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setEmailNotVerified(false);
+
+    // Enter loading state immediately — persists for the full request duration
     setIsSubmitting(true);
 
     try {
@@ -84,7 +158,20 @@ function LoginForm() {
       router.replace(decodeURIComponent(returnTo));
     } catch (err) {
       if (err instanceof ApiError) {
-        setError(err.message);
+        if (err.code === 'EMAIL_NOT_VERIFIED') {
+          // Phase 12: correct credentials, email just not verified.
+          // Show the specific message + inline resend widget on the login form —
+          // the user is already trying to get in, don't force navigation away.
+          setEmailNotVerified(true);
+          setUnverifiedEmail(email);
+          setError(err.message);
+        } else {
+          // 401 invalid credentials — generic anti-enumeration message
+          setError(err.message);
+        }
+      } else if (err instanceof TypeError) {
+        // Network failure — request never reached the server
+        setError("We couldn't reach the server. Please check your connection and try again.");
       } else {
         setError('Something went wrong. Please try again.');
       }
@@ -95,6 +182,7 @@ function LoginForm() {
 
   const handleGoogleSuccess = async (idToken: string) => {
     setError('');
+    setEmailNotVerified(false);
     setIsGoogleLoading(true);
     try {
       await loginWithGoogle(idToken);
@@ -146,8 +234,18 @@ function LoginForm() {
               role="alert"
               className="flex items-start gap-3 px-4 py-3 rounded-lg bg-risk-high/10 border border-risk-high/25 text-risk-high text-sm"
             >
-              <span className="mt-0.5 shrink-0">⚠</span>
+              <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
               <span>{error}</span>
+            </div>
+          )}
+
+          {/* Inline resend widget — only shown on EMAIL_NOT_VERIFIED */}
+          {emailNotVerified && unverifiedEmail && (
+            <div className="space-y-2">
+              <p className="text-text-muted text-xs text-center">
+                Verify your email to continue, or resend the link:
+              </p>
+              <InlineResendWidget email={unverifiedEmail} />
             </div>
           )}
 
@@ -184,7 +282,14 @@ function LoginForm() {
                 autoComplete="email"
                 required
                 value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                onChange={(e) => {
+                  setEmail(e.target.value);
+                  // Clear the NOT_VERIFIED state if the user edits the email
+                  if (emailNotVerified) {
+                    setEmailNotVerified(false);
+                    setError('');
+                  }
+                }}
                 className="input"
                 placeholder="you@example.com"
                 disabled={anyLoading}
