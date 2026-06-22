@@ -87,7 +87,7 @@ function GeneratingScreen({ destination }: { destination: string }) {
 
         <div className="flex items-center justify-center gap-2 text-sm mt-4" style={{ color: 'var(--color-text-secondary)' }}>
           <Loader2 size={15} className="animate-spin" style={{ color: 'var(--color-accent)' }} />
-          <span>Gemini is crafting your itinerary…</span>
+          <span>Trao is planning your days…</span>
         </div>
 
         <div className="mt-6 space-y-2 text-left">

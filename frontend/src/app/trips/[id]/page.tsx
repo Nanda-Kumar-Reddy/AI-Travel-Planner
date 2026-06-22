@@ -579,7 +579,7 @@ function RegenSheet({ tripId, dayNumber, onSuccess, onClose }: RegenSheetProps) 
               Regenerate Day {dayNumber}
             </h3>
             <p className="text-xs mt-0.5" style={{ color: 'var(--color-text-muted)' }}>
-              Gemini will create a fresh plan from your feedback
+              Trao will create a fresh plan from your feedback
             </p>
           </div>
           <button onClick={onClose} disabled={isSubmitting} className="btn-ghost p-2">

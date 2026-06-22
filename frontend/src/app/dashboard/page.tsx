@@ -146,7 +146,7 @@ function EmptyState({ onNewTrip }: { onNewTrip: () => void }) {
         No trips yet
       </h2>
       <p className="text-sm max-w-xs mb-6" style={{ color: 'var(--color-text-secondary)' }}>
-        Create your first AI-powered itinerary and let Gemini plan every detail.
+        Create your first AI-powered itinerary and let Trao plan every detail.
       </p>
       <button className="btn-primary" onClick={onNewTrip}>
         <Plus size={15} /> Plan my first trip
