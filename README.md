@@ -136,17 +136,30 @@ For detailed layer descriptions, see [docs/BACKEND.md → Layered Architecture](
 
 ## 5. Auth & Authorization Approach
 
-Authentication uses **JWT tokens stored in httpOnly cookies** — the token is invisible to JavaScript, which eliminates the token-theft-via-XSS attack vector that the more common `localStorage` approach leaves open.
+Authentication uses **dual httpOnly cookies** — an access token (JWT, 15-min expiry) and a refresh token (opaque random hex, 7-day expiry). Both are invisible to JavaScript, eliminating the XSS token-theft vector.
 
-**Session lifecycle:**
-1. `POST /api/auth/register` or `POST /api/auth/login` → server issues JWT (7-day expiry), sets `Set-Cookie: token=...; HttpOnly; Secure; SameSite=None`
-2. Every subsequent request from the browser automatically includes the cookie
-3. The `requireAuth` middleware verifies the JWT and attaches `{ id, email }` to `req.user`
-4. `POST /api/auth/logout` → server sets `maxAge: 0` on the cookie to clear it; client state is also cleared via Zustand
+**Session lifecycle (Phase 11):**
+1. `POST /api/auth/register` → creates an unverified account, sends verification email (see Email Verification below). No tokens issued at registration.
+2. `POST /api/auth/login` → verifies credentials, issues access+refresh token pair as two `httpOnly` cookies
+3. Every API request includes the access cookie automatically; `requireAuth` middleware verifies the JWT (no DB round-trip)
+4. On 401 (access token expired): frontend's silent-refresh interceptor in `lib/api.ts` calls `POST /api/auth/refresh` — rotates the refresh token and retries the original request transparently
+5. `POST /api/auth/logout` → revokes the specific refresh token document in MongoDB, clears both cookies
 
-**The cross-origin fix (Phase 8):** The frontend (Vercel) and backend (Render) are different origins. Browsers silently drop cookies on cross-origin requests unless three conditions are met: `SameSite=None`, `Secure=true`, and `credentials: 'include'` on the fetch. All three are implemented. Without the `SameSite=None` change, login appeared to succeed but every subsequent request returned 401.
+**Refresh token rotation + theft detection:**  
+The refresh token is an opaque random string (never a JWT) whose SHA-256 hash is stored in a `RefreshToken` MongoDB collection. On every refresh, the old token is marked revoked and a new one is issued. If a rotated-out token is presented again, it's treated as a theft signal — all sessions for that user are immediately invalidated.
 
-For the full auth design rationale, see [docs/BACKEND.md → Auth Design](./docs/BACKEND.md#3-auth-design).
+**Email verification (Phase 11):**  
+Registering creates an unverified account. A link is emailed (or logged to the server console in `EMAIL_MODE=mock`). The app is **non-blocking** by default — unverified users see a dismissible banner in the dashboard. Hard-blocking is opt-in via `EMAIL_VERIFY_REQUIRED=true`.
+
+**Google Sign-In / Sign-Up (Phase 11):**  
+Uses Google Identity Services (GIS) on the frontend — renders the official "Sign in with Google" button, returns a signed ID token. Backend verifies the ID token with `google-auth-library`, then runs a three-case upsert: (1) returning Google user, (2) existing local-password account → auto-link, (3) new user → create with `emailVerified: true`.
+
+**Object-level authorization (unchanged):**  
+Every resource query includes both `_id` and `userId: req.user.id`. Users can only access their own trips. A request for another user's resource returns the same 404 as a non-existent resource (no enumeration).
+
+**The cross-origin fix (Phase 8, extended in Phase 11):** Both httpOnly cookies carry `SameSite=None; Secure` in production (required for Vercel frontend ↔ Render backend). In development both run on localhost and use `SameSite=Lax`.
+
+For the complete auth design, rotation/theft-detection flow, email verification decision rationale, and Google OAuth three-case walkthrough, see **[docs/AUTH.md](./docs/AUTH.md)**.
 
 ---
 
