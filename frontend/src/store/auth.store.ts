@@ -1,6 +1,13 @@
 import { create } from 'zustand';
-import { api, ApiError } from '../lib/api';
-import type { User, AuthResponse, LoginRequest, RegisterRequest } from '../../../shared/src/index';
+import { api, ApiError, resetRefreshState } from '../lib/api';
+import type {
+  User,
+  AuthResponse,
+  LoginRequest,
+  RegisterRequest,
+  RegisterResponse,
+  GoogleAuthRequest,
+} from '../../../shared/src/index';
 
 interface AuthState {
   user: User | null;
@@ -11,20 +18,37 @@ interface AuthState {
   setUser: (user: User | null) => void;
 
   /**
-   * init — called once on app load (in root layout or a client provider).
-   * Hits GET /api/auth/me to check if the httpOnly cookie is valid.
+   * init — called once on app load (in root layout via AuthProvider).
+   * Hits GET /api/auth/me to check if the httpOnly access cookie is valid.
    * Sets user if authenticated, null if not. Always sets isInitialized = true.
+   *
+   * Phase 11: the /me endpoint now also triggers the silent refresh interceptor
+   * in api.ts if the access token is expired but the refresh token is still valid.
    */
   init: () => Promise<void>;
 
-  /** register — creates account, sets cookie, populates user state */
-  register: (data: RegisterRequest) => Promise<void>;
+  /**
+   * register — creates an unverified account.
+   * Phase 11: no longer issues tokens or logs the user in.
+   * Returns the message to display ("check your email").
+   * The frontend shows a success state and does NOT redirect to dashboard.
+   */
+  register: (data: RegisterRequest) => Promise<{ message: string; email: string }>;
 
-  /** login — authenticates, sets cookie, populates user state */
+  /** login — authenticates, sets access+refresh cookies, populates user state */
   login: (data: LoginRequest) => Promise<void>;
 
-  /** logout — clears cookie server-side, clears user state */
+  /** loginWithGoogle — sends GIS ID token to backend, three-case upsert, sets cookies */
+  loginWithGoogle: (idToken: string) => Promise<void>;
+
+  /** logout — revokes refresh token server-side, clears both cookies, clears user state */
   logout: () => Promise<void>;
+
+  /**
+   * resendVerification — requests a new verification email for the given address.
+   * Anti-enumeration: always succeeds regardless of whether email exists.
+   */
+  resendVerification: (email: string) => Promise<void>;
 }
 
 export const useAuthStore = create<AuthState>((set) => ({
@@ -40,7 +64,7 @@ export const useAuthStore = create<AuthState>((set) => ({
       const { user } = await api.get<AuthResponse>('/api/auth/me');
       set({ user, isInitialized: true, isLoading: false });
     } catch {
-      // 401 = no valid session — expected, not an error
+      // 401 = no valid session (or refresh failed) — expected, not an error
       set({ user: null, isInitialized: true, isLoading: false });
     }
   },
@@ -48,8 +72,9 @@ export const useAuthStore = create<AuthState>((set) => ({
   register: async (data: RegisterRequest) => {
     set({ isLoading: true });
     try {
-      const { user } = await api.post<AuthResponse>('/api/auth/register', data);
-      set({ user, isLoading: false });
+      const result = await api.post<RegisterResponse>('/api/auth/register', data);
+      set({ isLoading: false });
+      return result; // { message, email } — caller shows success UI
     } catch (err) {
       set({ isLoading: false });
       throw err; // re-throw so the form can display the error
@@ -60,6 +85,21 @@ export const useAuthStore = create<AuthState>((set) => ({
     set({ isLoading: true });
     try {
       const { user } = await api.post<AuthResponse>('/api/auth/login', data);
+      // Clear any stale refresh-failed flag from a previous session
+      resetRefreshState();
+      set({ user, isLoading: false });
+    } catch (err) {
+      set({ isLoading: false });
+      throw err;
+    }
+  },
+
+  loginWithGoogle: async (idToken: string) => {
+    set({ isLoading: true });
+    try {
+      const { user } = await api.post<AuthResponse>('/api/auth/google', { idToken } satisfies GoogleAuthRequest);
+      // Clear any stale refresh-failed flag from a previous session
+      resetRefreshState();
       set({ user, isLoading: false });
     } catch (err) {
       set({ isLoading: false });
@@ -70,12 +110,18 @@ export const useAuthStore = create<AuthState>((set) => ({
   logout: async () => {
     set({ isLoading: true });
     try {
+      // Server revokes the specific refresh token and clears both cookies
       await api.post('/api/auth/logout');
     } catch {
-      // Continue even if server call fails — clear client state regardless
+      // Even if the server call fails, clear client state
     } finally {
       set({ user: null, isLoading: false });
     }
+  },
+
+  resendVerification: async (email: string) => {
+    await api.post('/api/auth/resend-verification', { email });
+    // Always succeeds from the client's perspective (anti-enumeration)
   },
 }));
 
