@@ -39,7 +39,14 @@ app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// ─── Health check ─────────────────────────────────────────────────────────────
+// ─── Root + health check ──────────────────────────────────────────────────────
+// GET /        — Render health-check probes and keep-alive pings hit the root.
+//               Without this they fall into the 404 handler and pollute logs.
+// GET /health  — Explicit lightweight health endpoint for the Phase 8 cron.
+app.get('/', (_req: Request, res: Response) => {
+  res.status(200).json({ status: 'ok' });
+});
+
 app.get('/health', (_req: Request, res: Response) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
