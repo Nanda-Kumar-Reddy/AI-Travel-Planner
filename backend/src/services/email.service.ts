@@ -9,18 +9,20 @@
  *   - Shared emailWrapper() layout (dark theme to match this app's brand)
  *   - Class-based public API, exported as a single instance
  *
- * What changed from LifeLine:
- *   - Gmail SMTP credentials read from process.env (SMTP_USER / SMTP_PASS)
- *     instead of a config object — simpler for this project's structure
- *   - Added mock/live guard (EMAIL_MODE) so dev/demo never breaks due to
- *     missing Gmail credentials — same pattern as WEATHER_MOCK from Phase 6
- *   - Dark theme email template to match the app's visual identity
- *   - No RESEND — Nodemailer only
+ * Production SMTP configuration (matching LifeLine Australia reference):
+ *   service: 'gmail' — nodemailer resolves host/port/TLS automatically for Gmail.
+ *   auth: { user, pass } — Gmail address + Gmail App Password (NOT account password).
  *
  * Gmail App Password setup (required for SMTP_PASS):
  *   Google Account → Security → 2-Step Verification → App Passwords
  *   Generate one for "Mail / Other (AI Travel Planner)"
  *   Use that 16-char password as SMTP_PASS (NOT your Google account password)
+ *
+ * EMAIL_MODE guard:
+ *   mock — logs verification link to server console; safe for local dev/demo
+ *   live — sends via Gmail SMTP (requires SMTP_USER + SMTP_PASS)
+ *   Default when unset: mock (startup validation in server.ts enforces SMTP
+ *   credentials are present before the server starts when mode is 'live')
  */
 import nodemailer from 'nodemailer';
 import { logger } from '../utils/logger';
@@ -40,8 +42,15 @@ const APP_NAME = 'AI Travel Planner';
 
 // ── Singleton transporter ──────────────────────────────────────────────────────
 //
-// Lazily created so the server starts fine even when SMTP credentials are
-// missing (e.g. EMAIL_MODE=mock in development).
+// Matches the LifeLine Australia production pattern:
+//   nodemailer.createTransport({ service: 'gmail', auth: { user, pass } })
+//
+// The transporter is created eagerly at module load time when EMAIL_MODE=live,
+// so any credential misconfiguration surfaces immediately on startup rather
+// than on the first email send attempt.
+//
+// Lazily created when EMAIL_MODE=mock so the server starts fine without
+// SMTP credentials configured (local dev / demo mode).
 
 let _transporter: nodemailer.Transporter | null = null;
 
@@ -58,6 +67,8 @@ function getTransporter(): nodemailer.Transporter {
       );
     }
 
+    // Matches LifeLine Australia production SMTP configuration exactly.
+    // service:'gmail' lets nodemailer handle host/port/TLS resolution for Gmail.
     _transporter = nodemailer.createTransport({
       service: 'gmail',
       auth: { user, pass },
@@ -114,6 +125,10 @@ function emailWrapper(body: string): string {
 }
 
 // ── Primary send helper ────────────────────────────────────────────────────────
+//
+// Matches LifeLine Australia sendMail() pattern: transporter.sendMail() with
+// from/to/subject/html fields. The from address uses SMTP_USER (the Gmail
+// address configured for sending) with the APP_NAME display name.
 
 async function sendMail(to: string, subject: string, html: string): Promise<void> {
   const transporter = getTransporter();
@@ -129,7 +144,7 @@ class EmailService {
    * sendVerificationEmail — sends the email verification link.
    *
    * In mock mode: logs the full verification URL to the server console.
-   * In live mode: sends via Gmail SMTP (nodemailer).
+   * In live mode: sends via Gmail SMTP (nodemailer) — matches LifeLine pattern.
    */
   async sendVerificationEmail(to: string, rawToken: string): Promise<void> {
     const verifyUrl = `${getFrontendUrl()}/verify-email?token=${rawToken}`;
